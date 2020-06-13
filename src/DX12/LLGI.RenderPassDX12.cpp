@@ -8,17 +8,10 @@
 namespace LLGI
 {
 
-RenderPassDX12::RenderPassDX12(GraphicsDX12* graphics, bool isStrongRef) : graphics_(graphics), isStrongRef_(isStrongRef)
-{
-	if (isStrongRef_)
-	{
-		SafeAddRef(graphics_);
-	}
-}
+RenderPassDX12::RenderPassDX12(ID3D12Device* device) : device_(device) { SafeAddRef(device_); }
 
 RenderPassDX12 ::~RenderPassDX12()
 {
-
 	for (size_t i = 0; i < numRenderTarget_; i++)
 	{
 		if (renderTargets_[i].texture_ != nullptr)
@@ -26,20 +19,29 @@ RenderPassDX12 ::~RenderPassDX12()
 	}
 	renderTargets_.clear();
 
-	if (isStrongRef_)
-	{
-		SafeRelease(graphics_);
-	}
+	SafeRelease(device_);
 }
-
-bool RenderPassDX12::Initialize() { return false; }
 
 bool RenderPassDX12::Initialize(TextureDX12** textures, int numTextures, TextureDX12* depthTexture)
 {
 	if (textures[0]->Get() == nullptr)
 		return false;
 
-	isScreen_ = false;
+	if (!assignRenderTextures((Texture**)textures, numTextures))
+	{
+		return false;
+	}
+
+	if (!assignDepthTexture(depthTexture))
+	{
+		return false;
+	}
+
+	if (!getSize(screenSize_, (const Texture**)textures, numTextures, depthTexture))
+	{
+		return false;
+	}
+
 	renderTargets_.resize(numTextures);
 	numRenderTarget_ = numTextures;
 
@@ -50,30 +52,36 @@ bool RenderPassDX12::Initialize(TextureDX12** textures, int numTextures, Texture
 		SafeAddRef(renderTargets_[i].texture_);
 	}
 
-	auto size = textures[0]->GetSizeAs2D();
-	screenWindowSize_.X = size.X;
-	screenWindowSize_.Y = size.Y;
-
 	return true;
 }
 
-RenderPassPipelineState* RenderPassDX12::CreateRenderPassPipelineState()
-{
-	auto ret = renderPassPipelineState_.get();
-	if (ret == nullptr)
-	{
-		renderPassPipelineState_ = graphics_->CreateRenderPassPipelineState(false /*TODO*/, false /*TODO*/,this);
-		renderPassPipelineState_->SetRenderPass(this);
-		ret = renderPassPipelineState_.get();
-	}
-	SafeAddRef(ret);
-	return ret;
-}
-
-bool RenderPassDX12::CreateRenderTargetViews(CommandListDX12* commandList, DescriptorHeapDX12* rtDescriptorHeap)
+bool RenderPassDX12::ReinitializeRenderTargetViews(CommandListDX12* commandList,
+												   std::shared_ptr<DX12::DescriptorHeapAllocator> rtDescriptorHeap,
+												   std::shared_ptr<DX12::DescriptorHeapAllocator> dtDescriptorHeap)
 {
 	if (numRenderTarget_ == 0)
 		return false;
+
+	ID3D12DescriptorHeap* heapRTV = nullptr;
+	ID3D12DescriptorHeap* heapDSV = nullptr;
+
+	std::array<D3D12_CPU_DESCRIPTOR_HANDLE, 16> cpuDescriptorHandleRTV;
+	std::array<D3D12_GPU_DESCRIPTOR_HANDLE, 16> gpuDescriptorHandleRTV;
+	std::array<D3D12_CPU_DESCRIPTOR_HANDLE, 16> cpuDescriptorHandleDSV;
+	std::array<D3D12_GPU_DESCRIPTOR_HANDLE, 16> gpuDescriptorHandleDSV;
+
+	if (!rtDescriptorHeap->Allocate(heapRTV, cpuDescriptorHandleRTV, gpuDescriptorHandleRTV, numRenderTarget_))
+	{
+		return nullptr;
+	}
+
+	if (GetHasDepthTexture())
+	{
+		if (!dtDescriptorHeap->Allocate(heapDSV, cpuDescriptorHandleDSV, gpuDescriptorHandleDSV, 1))
+		{
+			return nullptr;
+		}
+	}
 
 	handleRTV_.resize(numRenderTarget_);
 
@@ -82,36 +90,31 @@ bool RenderPassDX12::CreateRenderTargetViews(CommandListDX12* commandList, Descr
 		D3D12_RENDER_TARGET_VIEW_DESC desc = {};
 		desc.Format = renderTargets_[i].texture_->GetDXGIFormat();
 		desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-		auto cpuHandle = rtDescriptorHeap->GetCpuHandle();
-		graphics_->GetDevice()->CreateRenderTargetView(renderTargets_[i].renderPass_, &desc, cpuHandle);
+		auto cpuHandle = cpuDescriptorHandleRTV[i];
+		device_->CreateRenderTargetView(renderTargets_[i].renderPass_, &desc, cpuHandle);
 		handleRTV_[i] = cpuHandle;
-		rtDescriptorHeap->IncrementCpuHandle(1);
-		rtDescriptorHeap->IncrementGpuHandle(1);
 
 		// memory barrior to make a rendertarget
-		renderTargets_[i].texture_->ResourceBarrior(commandList->GetCommandList(), D3D12_RESOURCE_STATE_RENDER_TARGET);
+		if (renderTargets_[i].texture_->GetType() != TextureType::Screen)
+		{
+			renderTargets_[i].texture_->ResourceBarrior(commandList->GetCommandList(), D3D12_RESOURCE_STATE_RENDER_TARGET);
+		}
 	}
 
-	return true;
-}
+	if (GetHasDepthTexture())
+	{
+		auto depthTexture = static_cast<TextureDX12*>(GetDepthTexture());
 
-bool RenderPassDX12::CreateScreenRenderTarget(D3D12_CPU_DESCRIPTOR_HANDLE handleRTV,
-											  ID3D12Resource* renderPass,
-											  const Color8& clearColor,
-											  const bool isColorCleared,
-											  const bool isDepthCleared,
-											  const Vec2I windowSize)
-{
-	numRenderTarget_ = 1;
-	handleRTV_.resize(1);
-	renderTargets_.resize(1);
+		D3D12_DEPTH_STENCIL_VIEW_DESC desc = {};
+		desc.Format = DXGI_FORMAT_D32_FLOAT;
+		desc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
 
-	renderTargets_[0].renderPass_ = renderPass;
-	handleRTV_[0] = handleRTV;
-	SetClearColor(clearColor);
-	SetIsColorCleared(isColorCleared);
-	SetIsDepthCleared(isDepthCleared);
-	screenWindowSize_ = windowSize;
+		auto cpuHandle = cpuDescriptorHandleDSV[0];
+		device_->CreateDepthStencilView(depthTexture->Get(), &desc, cpuHandle);
+		handleDSV_ = cpuHandle;
+
+		depthTexture->ResourceBarrior(commandList->GetCommandList(), D3D12_RESOURCE_STATE_DEPTH_WRITE);
+	}
 
 	return true;
 }

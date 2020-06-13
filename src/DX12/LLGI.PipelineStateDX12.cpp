@@ -44,7 +44,11 @@ void PipelineStateDX12::Compile()
 
 	for (size_t i = 0; i < shaders_.size(); i++)
 	{
-		auto& shaderData = static_cast<ShaderDX12*>(shaders_[i])->GetData();
+		auto shader = static_cast<ShaderDX12*>(shaders_.at(i));
+		if (shader == nullptr)
+			return;
+
+		auto& shaderData = shader->GetData();
 
 		if (i == static_cast<int>(ShaderStageType::Pixel))
 		{
@@ -66,7 +70,7 @@ void PipelineStateDX12::Compile()
 	for (int i = 0; i < VertexLayoutCount; i++)
 	{
 		elementDescs[i].SemanticName = this->VertexLayoutNames[i].c_str();
-		elementDescs[i].SemanticIndex = 0;
+		elementDescs[i].SemanticIndex = this->VertexLayoutSemantics[i];
 		elementDescs[i].AlignedByteOffset = elementOffset;
 		elementDescs[i].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
 
@@ -118,7 +122,7 @@ void PipelineStateDX12::Compile()
 	if (Culling == CullingMode::DoubleSide)
 		rasterizerDesc.CullMode = D3D12_CULL_MODE_NONE;
 
-	rasterizerDesc.FrontCounterClockwise = TRUE;
+	rasterizerDesc.FrontCounterClockwise = FALSE;
 	rasterizerDesc.DepthBias = D3D12_DEFAULT_DEPTH_BIAS;
 	rasterizerDesc.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
 	rasterizerDesc.SlopeScaledDepthBias = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
@@ -185,47 +189,41 @@ void PipelineStateDX12::Compile()
 	pipelineStateDesc.RasterizerState = rasterizerDesc;
 	pipelineStateDesc.BlendState = blendDesc;
 
-	// setup a depth stencil
-	std::array<D3D12_COMPARISON_FUNC, 10> depthCompareOps;
-	depthCompareOps[static_cast<int>(DepthFuncType::Never)] = D3D12_COMPARISON_FUNC_NEVER;
-	depthCompareOps[static_cast<int>(DepthFuncType::Less)] = D3D12_COMPARISON_FUNC_LESS;
-	depthCompareOps[static_cast<int>(DepthFuncType::Equal)] = D3D12_COMPARISON_FUNC_EQUAL;
-	depthCompareOps[static_cast<int>(DepthFuncType::LessEqual)] = D3D12_COMPARISON_FUNC_LESS_EQUAL;
-	depthCompareOps[static_cast<int>(DepthFuncType::Greater)] = D3D12_COMPARISON_FUNC_GREATER;
-	depthCompareOps[static_cast<int>(DepthFuncType::NotEqual)] = D3D12_COMPARISON_FUNC_NOT_EQUAL;
-	depthCompareOps[static_cast<int>(DepthFuncType::GreaterEqual)] = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
-	depthCompareOps[static_cast<int>(DepthFuncType::Always)] = D3D12_COMPARISON_FUNC_ALWAYS;
+	auto renderPassPipelineState = static_cast<RenderPassPipelineStateDX12*>(renderPassPipelineState_.get());
+	pipelineStateDesc.NumRenderTargets = renderPassPipelineState->RenderTargetCount;
 
-	D3D12_DEPTH_STENCIL_DESC depthStencilDesc = {};
-	depthStencilDesc.DepthFunc = depthCompareOps[static_cast<int>(DepthFunc)];
-	depthStencilDesc.DepthEnable = IsDepthTestEnabled;
-	depthStencilDesc.StencilEnable = IsDepthTestEnabled;
-	// TODO
-
-	// TODO (from renderpass)
-#if 1
-	auto renderpass = static_cast<RenderPassPipelineStateDX12*>(renderPassPipelineState_.get())->GetRenderPass();
-	pipelineStateDesc.NumRenderTargets = renderpass->GetCount();
-	for (int i = 0; i < 8; i++)
-		pipelineStateDesc.RTVFormats[i] = DXGI_FORMAT_UNKNOWN;
-	for (int i = 0; i < pipelineStateDesc.NumRenderTargets; i++)
+	for (uint32_t i = 0; i < pipelineStateDesc.NumRenderTargets; i++)
 	{
-		if (renderpass->GetRenderTarget(i)->texture_ != nullptr)
-			pipelineStateDesc.RTVFormats[i] = renderpass->GetRenderTarget(i)->texture_->GetDXGIFormat();
-		else
-		{
-			pipelineStateDesc.RTVFormats[i] = DXGI_FORMAT_R8G8B8A8_UNORM; // TODO
-			break;
-		}
+		pipelineStateDesc.RTVFormats[i] = renderPassPipelineState->RenderTargetFormats[i];
 	}
-#else
-	pipelineStateDesc.NumRenderTargets = 1;
-	for (int i = 0; i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
-		pipelineStateDesc.RTVFormats[i] = DXGI_FORMAT_UNKNOWN;
-	pipelineStateDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-#endif
 
-	pipelineStateDesc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+	// setup a depth stencil
+	if (renderPassPipelineState->HasDepth)
+	{
+		std::array<D3D12_COMPARISON_FUNC, 10> depthCompareOps;
+		depthCompareOps[static_cast<int>(DepthFuncType::Never)] = D3D12_COMPARISON_FUNC_NEVER;
+		depthCompareOps[static_cast<int>(DepthFuncType::Less)] = D3D12_COMPARISON_FUNC_LESS;
+		depthCompareOps[static_cast<int>(DepthFuncType::Equal)] = D3D12_COMPARISON_FUNC_EQUAL;
+		depthCompareOps[static_cast<int>(DepthFuncType::LessEqual)] = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+		depthCompareOps[static_cast<int>(DepthFuncType::Greater)] = D3D12_COMPARISON_FUNC_GREATER;
+		depthCompareOps[static_cast<int>(DepthFuncType::NotEqual)] = D3D12_COMPARISON_FUNC_NOT_EQUAL;
+		depthCompareOps[static_cast<int>(DepthFuncType::GreaterEqual)] = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+		depthCompareOps[static_cast<int>(DepthFuncType::Always)] = D3D12_COMPARISON_FUNC_ALWAYS;
+
+		D3D12_DEPTH_STENCIL_DESC depthStencilDesc = {};
+		depthStencilDesc.DepthFunc = depthCompareOps[static_cast<int>(DepthFunc)];
+		depthStencilDesc.DepthWriteMask = IsDepthWriteEnabled ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+		depthStencilDesc.DepthEnable = IsDepthTestEnabled | IsDepthWriteEnabled;
+		if (!IsDepthTestEnabled)
+		{
+			depthStencilDesc.DepthFunc = D3D12_COMPARISON_FUNC_NEVER;
+		}
+		depthStencilDesc.StencilEnable = false;
+
+		pipelineStateDesc.DepthStencilState = depthStencilDesc;
+		pipelineStateDesc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+	}
+
 	pipelineStateDesc.SampleDesc.Count = 1;
 	pipelineStateDesc.SampleMask = UINT_MAX;
 

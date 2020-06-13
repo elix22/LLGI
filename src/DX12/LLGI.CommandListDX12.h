@@ -10,25 +10,34 @@
 
 namespace LLGI
 {
-class DescriptorHeapDX12;
+
+struct PlatformContextDX12
+{
+	ID3D12GraphicsCommandList* commandList = nullptr;
+};
 
 class CommandListDX12 : public CommandList
 {
 private:
-	struct SwapBuffer
-	{
-		std::shared_ptr<DescriptorHeapDX12> cbreDescriptorHeap;
-		std::shared_ptr<DescriptorHeapDX12> rtDescriptorHeap;
-		std::shared_ptr<DescriptorHeapDX12> smpDescriptorHeap;
-		std::shared_ptr<ID3D12GraphicsCommandList> commandList;
-		std::shared_ptr<ID3D12CommandAllocator> commandAllocator;
-	};
+	static const int MaximumRenderTargetChange = 32;
+
+	std::shared_ptr<DX12::DescriptorHeapAllocator> samplerDescriptorHeap_;
+	std::shared_ptr<DX12::DescriptorHeapAllocator> cbDescriptorHeap_;
+	std::shared_ptr<DX12::DescriptorHeapAllocator> rtDescriptorHeap_;
+	std::shared_ptr<DX12::DescriptorHeapAllocator> dtDescriptorHeap_;
+
+	std::shared_ptr<ID3D12GraphicsCommandList> commandList_;
+	std::shared_ptr<ID3D12CommandAllocator> commandAllocator_;
+	ID3D12Fence* fence_ = nullptr;
+	HANDLE fenceEvent_ = nullptr;
+	UINT64 fenceValue_ = 1;
 
 	std::shared_ptr<GraphicsDX12> graphics_;
 	std::shared_ptr<RenderPassDX12> renderPass_;
 
-	std::vector<SwapBuffer> swapBuffers_;
-	int32_t currentSwap_ = -1;
+	ID3D12GraphicsCommandList* currentCommandList_ = nullptr;
+
+	void BeginInternal();
 
 public:
 	CommandListDX12();
@@ -37,13 +46,24 @@ public:
 
 	void Begin() override;
 	void End() override;
+	bool BeginWithPlatform(void* platformContextPtr) override;
+	void EndWithPlatform() override;
+
 	void BeginRenderPass(RenderPass* renderPass) override;
 	void EndRenderPass() override;
 	void Draw(int32_t pritimiveCount) override;
+	void CopyTexture(Texture* src, Texture* dst) override;
 
 	void Clear(const Color8& color);
 
+	void ClearDepth();
+
 	ID3D12GraphicsCommandList* GetCommandList() const;
+
+	ID3D12Fence* GetFence() const;
+	UINT64 GetAndIncFenceValue();
+
+	void WaitUntilCompleted() override;
 };
 
 } // namespace LLGI

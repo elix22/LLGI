@@ -3,10 +3,14 @@
 
 #include "../LLGI.Base.h"
 #include <iostream>
+#include <unordered_map>
 
 #ifdef _WIN32
 #define VK_PROTOTYPES
 #define VK_USE_PLATFORM_WIN32_KHR
+#else
+#define VK_PROTOTYPES
+#define VK_USE_PLATFORM_XCB_KHR
 #endif
 
 #include <vulkan/vulkan.h>
@@ -22,28 +26,47 @@
 		}                                                                                                                                  \
 	}
 
+namespace std
+{
+
+template <>
+struct hash<vk::Format>
+{
+	size_t operator()(const vk::Format& _Keyval) const noexcept { return std::hash<uint32_t>()(static_cast<uint32_t>(_Keyval)); }
+};
+
+} // namespace std
+
 namespace LLGI
 {
 
 class GraphicsVulkan;
 class PipelineStateVulkan;
+class TextureVulkan;
+class RenderPassVulkan;
+class RenderPassPipelineStateCacheVulkan;
 
 class VulkanHelper
 {
 public:
 	static const char* getResultName(VkResult result);
+    static VkFormat TextureFormatToVkFormat(TextureFormatType format);
+	static TextureFormatType VkFormatToTextureFormat(VkFormat format);
 };
 
 class Buffer
 {
 	std::shared_ptr<GraphicsVulkan> graphics_;
+	vk::Buffer buffer_;
+	vk::DeviceMemory devMem_;
+	bool isExternalResource_ = false;
 
 public:
-	vk::Buffer buffer;
-	vk::DeviceMemory devMem;
-
 	Buffer(GraphicsVulkan* graphics);
 	virtual ~Buffer();
+	void Attach(vk::Buffer buffer, vk::DeviceMemory devMem, bool isExternalResource = false);
+	vk::Buffer buffer() const { return buffer_; }
+	vk::DeviceMemory devMem() const { return devMem_; }
 };
 
 class VulkanBuffer

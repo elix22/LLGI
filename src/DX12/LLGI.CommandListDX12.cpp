@@ -1,6 +1,7 @@
 
 #include "LLGI.CommandListDX12.h"
 #include "LLGI.ConstantBufferDX12.h"
+#include "LLGI.DescriptorHeapDX12.h"
 #include "LLGI.GraphicsDX12.h"
 #include "LLGI.IndexBufferDX12.h"
 #include "LLGI.PipelineStateDX12.h"
@@ -10,9 +11,30 @@
 
 namespace LLGI
 {
+
+void CommandListDX12::BeginInternal()
+{
+	rtDescriptorHeap_->Reset();
+
+	dtDescriptorHeap_->Reset();
+
+	cbDescriptorHeap_->Reset();
+
+	samplerDescriptorHeap_->Reset();
+}
+
 CommandListDX12::CommandListDX12() {}
 
-CommandListDX12::~CommandListDX12() { swapBuffers_.clear(); }
+CommandListDX12::~CommandListDX12()
+{
+	SafeRelease(fence_);
+
+	if (fenceEvent_ != nullptr)
+	{
+		CloseHandle(fenceEvent_);
+		fenceEvent_ = nullptr;
+	}
+}
 
 bool CommandListDX12::Initialize(GraphicsDX12* graphics, int32_t drawingCount)
 {
@@ -21,90 +43,107 @@ bool CommandListDX12::Initialize(GraphicsDX12* graphics, int32_t drawingCount)
 	SafeAddRef(graphics);
 	graphics_ = CreateSharedPtr(graphics);
 
-	swapBuffers_.resize(graphics_->GetSwapBufferCount());
-
-	for (int32_t i = 0; i < graphics_->GetSwapBufferCount(); i++)
+	// Command Allocator
+	ID3D12CommandAllocator* commandAllocator = nullptr;
+	hr = graphics_->GetDevice()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&commandAllocator));
+	if (FAILED(hr))
 	{
-		ID3D12CommandAllocator* commandAllocator = nullptr;
-		ID3D12GraphicsCommandList* commandList = nullptr;
-
-		hr = graphics_->GetDevice()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&commandAllocator));
-		if (FAILED(hr))
-		{
-			goto FAILED_EXIT;
-		}
-		swapBuffers_[i].commandAllocator = CreateSharedPtr(commandAllocator);
-
-		hr = graphics_->GetDevice()->CreateCommandList(
-			0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocator, NULL, IID_PPV_ARGS(&commandList));
-		if (FAILED(hr))
-		{
-			goto FAILED_EXIT;
-		}
-		commandList->Close();
-		swapBuffers_[i].commandList = CreateSharedPtr(commandList);
-
-		swapBuffers_[i].cbreDescriptorHeap = std::make_shared<DescriptorHeapDX12>(
-			graphics_, D3D12_DESCRIPTOR_HEAP_TYPE::D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, drawingCount * NumTexture + 2, 2);
-
-		// the maximum render target is defined temporary
-		swapBuffers_[i].rtDescriptorHeap = std::make_shared<DescriptorHeapDX12>(
-			graphics_, D3D12_DESCRIPTOR_HEAP_TYPE::D3D12_DESCRIPTOR_HEAP_TYPE_RTV, drawingCount / 2, 2);
-		swapBuffers_[i].smpDescriptorHeap = std::make_shared<DescriptorHeapDX12>(
-			graphics_, D3D12_DESCRIPTOR_HEAP_TYPE::D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, drawingCount * NumTexture, 2);
+		SafeRelease(graphics_);
+		goto FAILED_EXIT;
 	}
+	commandAllocator_ = CreateSharedPtr(commandAllocator);
 
+	// Command List
+	ID3D12GraphicsCommandList* commandList = nullptr;
+	hr = graphics_->GetDevice()->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocator, NULL, IID_PPV_ARGS(&commandList));
+	if (FAILED(hr))
+	{
+		SafeRelease(graphics_);
+		SafeRelease(commandAllocator_);
+		goto FAILED_EXIT;
+	}
+	commandList->Close();
+	commandList_ = CreateSharedPtr(commandList);
+
+	rtDescriptorHeap_ =
+		std::make_shared<DX12::DescriptorHeapAllocator>(graphics_, D3D12_DESCRIPTOR_HEAP_TYPE::D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+
+	dtDescriptorHeap_ =
+		std::make_shared<DX12::DescriptorHeapAllocator>(graphics_, D3D12_DESCRIPTOR_HEAP_TYPE::D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+
+	samplerDescriptorHeap_ =
+		std::make_shared<DX12::DescriptorHeapAllocator>(graphics_, D3D12_DESCRIPTOR_HEAP_TYPE::D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+
+	cbDescriptorHeap_ =
+		std::make_shared<DX12::DescriptorHeapAllocator>(graphics_, D3D12_DESCRIPTOR_HEAP_TYPE::D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+	hr = graphics_->GetDevice()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_));
+	if (FAILED(hr))
+	{
+		goto FAILED_EXIT;
+	}
+	fenceEvent_ = CreateEvent(NULL, FALSE, FALSE, NULL);
 	return true;
 
 FAILED_EXIT:;
-	graphics_.reset();
-	swapBuffers_.clear();
 	return false;
 }
 
 void CommandListDX12::Begin()
 {
-	currentSwap_++;
-	currentSwap_ %= swapBuffers_.size();
+	commandAllocator_->Reset();
+	commandList_->Reset(commandAllocator_.get(), nullptr);
 
-	auto& swapBuffer = swapBuffers_[currentSwap_];
-	auto commandList = swapBuffer.commandList;
-	commandList->Reset(swapBuffer.commandAllocator.get(), nullptr);
+	BeginInternal();
 
-	swapBuffer.cbreDescriptorHeap->Reset();
-	swapBuffer.rtDescriptorHeap->Reset();
-	swapBuffer.smpDescriptorHeap->Reset();
+	currentCommandList_ = commandList_.get();
 
 	CommandList::Begin();
 }
 
 void CommandListDX12::End()
 {
-	auto& swapBuffer = swapBuffers_[currentSwap_];
-	swapBuffer.commandList->Close();
+	assert(currentCommandList_ != nullptr);
+	currentCommandList_->Close();
+	currentCommandList_ = nullptr;
+
+	CommandList::End();
+}
+
+bool CommandListDX12::BeginWithPlatform(void* platformContextPtr)
+{
+	auto ptr = reinterpret_cast<PlatformContextDX12*>(platformContextPtr);
+
+	BeginInternal();
+
+	currentCommandList_ = ptr->commandList;
+
+	return CommandList::BeginWithPlatform(platformContextPtr);
+}
+
+void CommandListDX12::EndWithPlatform()
+{
+	assert(currentCommandList_ != nullptr);
+	currentCommandList_ = nullptr;
+	CommandList::EndWithPlatform();
 }
 
 void CommandListDX12::BeginRenderPass(RenderPass* renderPass)
 {
-	assert(currentSwap_ >= 0);
-
-	auto& swapBuffer = swapBuffers_[currentSwap_];
-	auto commandList = swapBuffer.commandList;
+	assert(currentCommandList_ != nullptr);
 
 	SafeAddRef(renderPass);
 	renderPass_ = CreateSharedPtr((RenderPassDX12*)renderPass);
 
 	if (renderPass != nullptr)
 	{
-		if (!renderPass_->GetIsScreen())
+		// Set render target
+		if (!renderPass_->ReinitializeRenderTargetViews(this, rtDescriptorHeap_, dtDescriptorHeap_))
 		{
-			renderPass_->CreateRenderTargetViews(this, swapBuffer.rtDescriptorHeap.get());
+			throw "Failed to start renderPass because of descriptors.";
 		}
 
-		// Set render target
-		commandList->OMSetRenderTargets(renderPass_->GetCount(), renderPass_->GetHandleRTV(), FALSE, nullptr);
-
-		// TODO depth...
+		currentCommandList_->OMSetRenderTargets(renderPass_->GetCount(), renderPass_->GetHandleRTV(), FALSE, renderPass_->GetHandleDSV());
 
 		// Reset scissor
 		D3D12_RECT rects[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
@@ -112,7 +151,7 @@ void CommandListDX12::BeginRenderPass(RenderPass* renderPass)
 		for (int i = 0; i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT && i < renderPass_->GetCount(); i++)
 		{
 			auto size = (renderPass_->GetRenderTarget(i)->texture_ != nullptr) ? renderPass_->GetRenderTarget(i)->texture_->GetSizeAs2D()
-																			   : renderPass_->GetScreenWindowSize();
+																			   : renderPass_->GetScreenSize();
 			rects[i].top = 0;
 			rects[i].left = 0;
 			rects[i].right = size.X;
@@ -125,26 +164,35 @@ void CommandListDX12::BeginRenderPass(RenderPass* renderPass)
 			viewports[i].MinDepth = 0.0f;
 			viewports[i].MaxDepth = 1.0f;
 		}
-		commandList->RSSetScissorRects(renderPass_->GetCount(), rects);
-		commandList->RSSetViewports(renderPass_->GetCount(), viewports);
+		currentCommandList_->RSSetScissorRects(renderPass_->GetCount(), rects);
+		currentCommandList_->RSSetViewports(renderPass_->GetCount(), viewports);
 
-		// Clear color
 		if (renderPass_->GetIsColorCleared())
 		{
 			Clear(renderPass_->GetClearColor());
 		}
+
+		if (renderPass_->GetIsDepthCleared())
+		{
+			ClearDepth();
+		}
 	}
+
+	CommandList::BeginRenderPass(renderPass);
 }
 
-void CommandListDX12::EndRenderPass() { renderPass_.reset(); }
+void CommandListDX12::EndRenderPass()
+{
+	renderPass_.reset();
+	CommandList::EndRenderPass();
+}
 
 void CommandListDX12::Draw(int32_t pritimiveCount)
 {
-	auto& swapBuffer = swapBuffers_[currentSwap_];
-	auto commandList = swapBuffer.commandList;
+	assert(currentCommandList_ != nullptr);
 
 	BindingVertexBuffer vb_;
-	IndexBuffer* ib_ = nullptr;
+	BindingIndexBuffer ib_;
 	ConstantBuffer* cb = nullptr;
 	PipelineState* pip_ = nullptr;
 
@@ -157,11 +205,11 @@ void CommandListDX12::Draw(int32_t pritimiveCount)
 	GetCurrentPipelineState(pip_, isPipDirtied);
 
 	assert(vb_.vertexBuffer != nullptr);
-	assert(ib_ != nullptr);
+	assert(ib_.indexBuffer != nullptr);
 	assert(pip_ != nullptr);
 
 	auto vb = static_cast<VertexBufferDX12*>(vb_.vertexBuffer);
-	auto ib = static_cast<IndexBufferDX12*>(ib_);
+	auto ib = static_cast<IndexBufferDX12*>(ib_.indexBuffer);
 	auto pip = static_cast<PipelineStateDX12*>(pip_);
 
 	{
@@ -171,37 +219,75 @@ void CommandListDX12::Draw(int32_t pritimiveCount)
 		vertexView.SizeInBytes = vb_.vertexBuffer->GetSize() - vb_.offset;
 		if (vb_.vertexBuffer != nullptr)
 		{
-			commandList->IASetVertexBuffers(0, 1, &vertexView);
+			currentCommandList_->IASetVertexBuffers(0, 1, &vertexView);
 		}
 	}
 
 	if (ib != nullptr)
 	{
 		D3D12_INDEX_BUFFER_VIEW indexView;
-		indexView.BufferLocation = ib->Get()->GetGPUVirtualAddress();
-		indexView.SizeInBytes = ib->GetStride() * ib->GetCount();
+		indexView.BufferLocation = ib->Get()->GetGPUVirtualAddress() + ib_.offset;
+		indexView.SizeInBytes = ib->GetStride() * ib->GetCount() - ib_.offset;
 		indexView.Format = ib->GetStride() == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
-		commandList->IASetIndexBuffer(&indexView);
+		currentCommandList_->IASetIndexBuffer(&indexView);
 	}
 
 	if (pip != nullptr)
 	{
-		commandList->SetGraphicsRootSignature(pip->GetRootSignature());
+		currentCommandList_->SetGraphicsRootSignature(pip->GetRootSignature());
 		auto p = pip->GetPipelineState();
-		commandList->SetPipelineState(p);
+		currentCommandList_->SetPipelineState(p);
+	}
+
+	// count descriptor
+	int32_t requiredCBDescriptorCount = 2;
+	int32_t requiredSamplerDescriptorCount = 1;
+
+	for (int stage_ind = 0; stage_ind < static_cast<int>(ShaderStageType::Max); stage_ind++)
+	{
+		for (int unit_ind = 0; unit_ind < currentTextures[stage_ind].size(); unit_ind++)
+		{
+			if (currentTextures[stage_ind][unit_ind].texture != nullptr)
+			{
+				requiredSamplerDescriptorCount = max(requiredSamplerDescriptorCount, unit_ind + 1);
+			}
+		}
+	}
+
+	requiredCBDescriptorCount += requiredSamplerDescriptorCount;
+
+	ID3D12DescriptorHeap* heapSampler = nullptr;
+	ID3D12DescriptorHeap* heapConstant = nullptr;
+
+	std::array<D3D12_CPU_DESCRIPTOR_HANDLE, 16> cpuDescriptorHandleSampler;
+	std::array<D3D12_GPU_DESCRIPTOR_HANDLE, 16> gpuDescriptorHandleSampler;
+	std::array<D3D12_CPU_DESCRIPTOR_HANDLE, 16> cpuDescriptorHandleConstant;
+	std::array<D3D12_GPU_DESCRIPTOR_HANDLE, 16> gpuDescriptorHandleConstant;
+
+	if (!samplerDescriptorHeap_->Allocate(
+			heapSampler, cpuDescriptorHandleSampler, gpuDescriptorHandleSampler, requiredSamplerDescriptorCount))
+	{
+		Log(LogType::Error, "Failed to draw because of descriptors.");
+		return;
+	}
+
+	if (!cbDescriptorHeap_->Allocate(heapConstant, cpuDescriptorHandleConstant, gpuDescriptorHandleConstant, requiredCBDescriptorCount))
+	{
+		Log(LogType::Error, "Failed to draw because of descriptors.");
+		return;
 	}
 
 	{
 		// set using descriptor heaps
 		ID3D12DescriptorHeap* heaps[] = {
-			swapBuffer.cbreDescriptorHeap->GetHeap(),
-			swapBuffer.smpDescriptorHeap->GetHeap(),
+			heapConstant,
+			heapSampler,
 		};
-		commandList->SetDescriptorHeaps(2, heaps);
+		currentCommandList_->SetDescriptorHeaps(2, heaps);
 
 		// set descriptor tables
-		commandList->SetGraphicsRootDescriptorTable(0, swapBuffer.cbreDescriptorHeap->GetGpuHandle());
-		commandList->SetGraphicsRootDescriptorTable(1, swapBuffer.smpDescriptorHeap->GetGpuHandle());
+		currentCommandList_->SetGraphicsRootDescriptorTable(0, gpuDescriptorHandleConstant[0]);
+		currentCommandList_->SetGraphicsRootDescriptorTable(1, gpuDescriptorHandleSampler[0]);
 	}
 
 	int increment = NumTexture * static_cast<int>(ShaderStageType::Max);
@@ -217,7 +303,7 @@ void CommandListDX12::Draw(int32_t pritimiveCount)
 				D3D12_CONSTANT_BUFFER_VIEW_DESC desc = {};
 				desc.BufferLocation = _cb->Get()->GetGPUVirtualAddress() + _cb->GetOffset();
 				desc.SizeInBytes = _cb->GetActualSize();
-				auto cpuHandle = swapBuffer.cbreDescriptorHeap->GetCpuHandle();
+				auto cpuHandle = cpuDescriptorHandleConstant[stage_ind];
 				graphics_->GetDevice()->CreateConstantBufferView(&desc, cpuHandle);
 			}
 			else
@@ -226,12 +312,10 @@ void CommandListDX12::Draw(int32_t pritimiveCount)
 				D3D12_CONSTANT_BUFFER_VIEW_DESC desc = {};
 				desc.BufferLocation = D3D12_GPU_VIRTUAL_ADDRESS();
 				desc.SizeInBytes = 0;
-				auto cpuHandle = swapBuffer.cbreDescriptorHeap->GetCpuHandle();
+				auto cpuHandle = cpuDescriptorHandleConstant[stage_ind];
 				graphics_->GetDevice()->CreateConstantBufferView(&desc, cpuHandle);
 			}
-			swapBuffer.cbreDescriptorHeap->IncrementCpuHandle(1);
 		}
-		swapBuffer.cbreDescriptorHeap->IncrementGpuHandle(static_cast<int>(ShaderStageType::Max));
 	}
 
 	{
@@ -246,15 +330,15 @@ void CommandListDX12::Draw(int32_t pritimiveCount)
 					auto minMagFilter = currentTextures[stage_ind][unit_ind].minMagFilter;
 
 					// Make barrior to use a render target
-					if (texture->IsRenderTexture())
+					if (texture->GetType() == TextureType::Render)
 					{
 						if (stage_ind == static_cast<int>(ShaderStageType::Pixel))
 						{
-							texture->ResourceBarrior(commandList.get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+							texture->ResourceBarrior(currentCommandList_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 						}
 						else
 						{
-							texture->ResourceBarrior(commandList.get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+							texture->ResourceBarrior(currentCommandList_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 						}
 					}
 
@@ -267,7 +351,7 @@ void CommandListDX12::Draw(int32_t pritimiveCount)
 						srvDesc.Texture2D.MipLevels = 1;
 						srvDesc.Texture2D.MostDetailedMip = 0;
 
-						auto cpuHandle = swapBuffer.cbreDescriptorHeap->GetCpuHandle();
+						auto cpuHandle = cpuDescriptorHandleConstant[static_cast<int32_t>(ShaderStageType::Max) + unit_ind];
 						graphics_->GetDevice()->CreateShaderResourceView(texture->Get(), &srvDesc, cpuHandle);
 					}
 
@@ -275,8 +359,14 @@ void CommandListDX12::Draw(int32_t pritimiveCount)
 					{
 						D3D12_SAMPLER_DESC samplerDesc = {};
 
-						// TODO
-						samplerDesc.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+						if (minMagFilter == TextureMinMagFilter::Nearest)
+						{
+							samplerDesc.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+						}
+						else
+						{
+							samplerDesc.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+						}
 
 						if (wrapMode == TextureWrapMode::Repeat)
 						{
@@ -296,31 +386,57 @@ void CommandListDX12::Draw(int32_t pritimiveCount)
 						samplerDesc.MinLOD = 0.0f;
 						samplerDesc.MaxLOD = D3D12_FLOAT32_MAX;
 
-						auto cpuHandle = swapBuffer.smpDescriptorHeap->GetCpuHandle();
+						auto cpuHandle = cpuDescriptorHandleSampler[unit_ind];
 						graphics_->GetDevice()->CreateSampler(&samplerDesc, cpuHandle);
 					}
 				}
-				swapBuffer.cbreDescriptorHeap->IncrementCpuHandle(1);
-				swapBuffer.smpDescriptorHeap->IncrementCpuHandle(1);
 			}
 		}
-		swapBuffer.cbreDescriptorHeap->IncrementGpuHandle(increment);
-		swapBuffer.smpDescriptorHeap->IncrementGpuHandle(increment);
 	}
 
 	// setup a topology (triangle)
-	commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	currentCommandList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
 	// draw polygon
-	commandList->DrawIndexedInstanced(pritimiveCount * 3 /*triangle*/, 1, 0, 0, 0);
+	currentCommandList_->DrawIndexedInstanced(pritimiveCount * 3 /*triangle*/, 1, 0, 0, 0);
 
 	CommandList::Draw(pritimiveCount);
 }
 
+void CommandListDX12::CopyTexture(Texture* src, Texture* dst)
+{
+	if (isInRenderPass_)
+	{
+		Log(LogType::Error, "Please call CopyTexture outside of RenderPass");
+		return;
+	}
+
+	auto srcTex = static_cast<TextureDX12*>(src);
+	auto dstTex = static_cast<TextureDX12*>(dst);
+
+	D3D12_TEXTURE_COPY_LOCATION srcLoc = {}, dstLoc = {};
+
+	srcLoc.pResource = srcTex->Get();
+
+	dstLoc.pResource = dstTex->Get();
+
+	auto srcState = srcTex->GetState();
+
+	srcTex->ResourceBarrior(currentCommandList_, D3D12_RESOURCE_STATE_COPY_SOURCE);
+	dstTex->ResourceBarrior(currentCommandList_, D3D12_RESOURCE_STATE_COPY_DEST);
+
+	currentCommandList_->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+
+	dstTex->ResourceBarrior(currentCommandList_, D3D12_RESOURCE_STATE_GENERIC_READ);
+	srcTex->ResourceBarrior(currentCommandList_, srcState);
+
+	RegisterReferencedObject(src);
+	RegisterReferencedObject(dst);
+}
+
 void CommandListDX12::Clear(const Color8& color)
 {
-	auto& swapBuffer = swapBuffers_[currentSwap_];
-	auto commandList = swapBuffer.commandList;
+	assert(currentCommandList_ != nullptr);
 
 	auto rt = renderPass_;
 	if (rt == nullptr)
@@ -331,16 +447,53 @@ void CommandListDX12::Clear(const Color8& color)
 	auto handle = rt->GetHandleRTV();
 	for (int i = 0; i < rt->GetCount(); i++)
 	{
-		commandList->ClearRenderTargetView(handle[i], color_, 0, nullptr);
+		currentCommandList_->ClearRenderTargetView(handle[i], color_, 0, nullptr);
 	}
 }
 
-ID3D12GraphicsCommandList* CommandListDX12::GetCommandList() const
+void CommandListDX12::ClearDepth()
 {
-	auto& swapBuffer = swapBuffers_[currentSwap_];
-	auto commandList = swapBuffer.commandList;
+	assert(currentCommandList_ != nullptr);
 
-	return commandList.get();
+	auto rt = renderPass_;
+	if (rt == nullptr)
+		return;
+
+	if (!rt->GetHasDepthTexture())
+	{
+		return;
+	}
+
+	auto handle = rt->GetHandleDSV();
+	for (int i = 0; i < rt->GetCount(); i++)
+	{
+		currentCommandList_->ClearDepthStencilView(handle[i], D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+	}
+}
+
+ID3D12GraphicsCommandList* CommandListDX12::GetCommandList() const { return commandList_.get(); }
+
+ID3D12Fence* CommandListDX12::GetFence() const { return fence_; }
+
+UINT64 CommandListDX12::GetAndIncFenceValue()
+{
+	auto ret = fenceValue_;
+	fenceValue_ += 1;
+	return ret;
+}
+
+void CommandListDX12::WaitUntilCompleted()
+{
+
+	if (fence_->GetCompletedValue() < fenceValue_ - 1)
+	{
+		auto hr = fence_->SetEventOnCompletion(fenceValue_ - 1, fenceEvent_);
+		if (FAILED(hr))
+		{
+			return;
+		}
+		WaitForSingleObject(fenceEvent_, INFINITE);
+	}
 }
 
 } // namespace LLGI

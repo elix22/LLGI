@@ -1,6 +1,9 @@
 #include "LLGI.PipelineStateVulkan.h"
 #include "LLGI.ShaderVulkan.h"
 
+// for x11
+#undef Always
+
 namespace LLGI
 {
 
@@ -26,16 +29,16 @@ PipelineStateVulkan ::~PipelineStateVulkan()
 		descriptorSetLayouts[i] = nullptr;
 	}
 
-	if (pipelineLayout != nullptr)
+	if (pipelineLayout_)
 	{
-		graphics_->GetDevice().destroyPipelineLayout(pipelineLayout);
-		pipelineLayout = nullptr;
+		graphics_->GetDevice().destroyPipelineLayout(pipelineLayout_);
+		pipelineLayout_ = nullptr;
 	}
 
-	if (pipeline != nullptr)
+	if (pipeline_)
 	{
-		graphics_->GetDevice().destroyPipeline(pipeline);
-		pipeline = nullptr;
+		graphics_->GetDevice().destroyPipeline(pipeline_);
+		pipeline_ = nullptr;
 	}
 
 	SafeRelease(graphics_);
@@ -172,7 +175,7 @@ void PipelineStateVulkan::Compile()
 	viewportStateInfo.viewportCount = 1;
 
 	vk::Rect2D scissor = {};
-	scissor.offset = {0, 0};
+	scissor.offset = vk::Offset2D(0, 0);
 	scissor.extent.width = 1280; // TODO : temp
 	scissor.extent.height = 720; // TODO : temp
 
@@ -206,6 +209,7 @@ void PipelineStateVulkan::Compile()
 	rasterizationState.depthBiasConstantFactor = 0.0f;
 	rasterizationState.depthBiasClamp = 0.0f;
 	rasterizationState.depthBiasSlopeFactor = 0.0f;
+    rasterizationState.lineWidth = 1.0f;    // disable lineWidth. (Must not be zero)
 
 	graphicsPipelineInfo.pRasterizationState = &rasterizationState;
 
@@ -307,7 +311,7 @@ void PipelineStateVulkan::Compile()
 	graphicsPipelineInfo.renderPass = static_cast<RenderPassPipelineStateVulkan*>(renderPassPipelineState_.get())->GetRenderPass();
 
 	// uniform layout info
-	std::array<vk::DescriptorSetLayoutBinding, 2> uboLayoutBindings;
+	std::array<vk::DescriptorSetLayoutBinding, 3> uboLayoutBindings;
 	uboLayoutBindings[0].binding = 0;
 	uboLayoutBindings[0].descriptorType = vk::DescriptorType::eUniformBufferDynamic;
 	uboLayoutBindings[0].descriptorCount = 1;
@@ -320,8 +324,14 @@ void PipelineStateVulkan::Compile()
 	uboLayoutBindings[1].stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
 	uboLayoutBindings[1].pImmutableSamplers = nullptr;
 
+	uboLayoutBindings[2].binding = 2;
+	uboLayoutBindings[2].descriptorType = vk::DescriptorType::eCombinedImageSampler;
+	uboLayoutBindings[2].descriptorCount = 1;
+	uboLayoutBindings[2].stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
+	uboLayoutBindings[2].pImmutableSamplers = nullptr;
+
 	vk::DescriptorSetLayoutCreateInfo descriptorSetLayoutInfo;
-	descriptorSetLayoutInfo.bindingCount = 2;
+	descriptorSetLayoutInfo.bindingCount = uboLayoutBindings.size();
 	descriptorSetLayoutInfo.pBindings = uboLayoutBindings.data();
 
 	descriptorSetLayouts[0] = graphics_->GetDevice().createDescriptorSetLayout(descriptorSetLayoutInfo);
@@ -333,11 +343,11 @@ void PipelineStateVulkan::Compile()
 	layoutInfo.pushConstantRangeCount = 0;
 	layoutInfo.pPushConstantRanges = nullptr;
 
-	pipelineLayout = graphics_->GetDevice().createPipelineLayout(layoutInfo);
-	graphicsPipelineInfo.layout = pipelineLayout;
+	pipelineLayout_ = graphics_->GetDevice().createPipelineLayout(layoutInfo);
+	graphicsPipelineInfo.layout = pipelineLayout_;
 
 	// setup a pipeline
-	pipeline = graphics_->GetDevice().createGraphicsPipeline(nullptr, graphicsPipelineInfo);
+	pipeline_ = graphics_->GetDevice().createGraphicsPipeline(nullptr, graphicsPipelineInfo);
 }
 
 } // namespace LLGI

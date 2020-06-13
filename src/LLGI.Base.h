@@ -8,6 +8,7 @@
 
 #include <array>
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <queue>
 #include <string>
@@ -15,6 +16,9 @@
 
 namespace LLGI
 {
+
+static const int RenderTargetMax = 8;
+static const int VertexLayoutMax = 16;
 
 enum class DeviceType
 {
@@ -120,6 +124,8 @@ struct Vec2I
 	Vec2I() : X(0), Y(0) {}
 
 	Vec2I(int32_t x, int32_t y) : X(x), Y(y) {}
+
+	bool operator==(const Vec2I& o) const { return X == o.X && Y == o.Y; }
 };
 
 struct Vec2F
@@ -183,7 +189,19 @@ enum class TextureFormatType
 	BC2_SRGB = 9,
 	BC3_SRGB = 10,
 
+	//! for internal
+	B8G8R8A8_UNORM = 254,
 	Uknown = 255,
+};
+
+enum class TextureType
+{
+	Screen,
+	Color,
+	Depth,
+	Render,
+	Cube,
+	Unknown,
 };
 
 struct DataStructure
@@ -267,7 +285,30 @@ template <typename T> struct ReferenceDeleter
 	}
 };
 
-template <typename T> static std::shared_ptr<T> CreateSharedPtr(T* p) { return std::shared_ptr<T>(p, ReferenceDeleter<T>()); }
+template <typename T> static std::shared_ptr<T> CreateSharedPtr(T* p, bool addRef = false)
+{
+	if (addRef)
+	{
+		SafeAddRef(p);
+	}
+
+	return std::shared_ptr<T>(p, ReferenceDeleter<T>());
+}
+
+template <typename T> inline std::unique_ptr<T, ReferenceDeleter<T>> CreateUniqueReference(T* ptr, bool addRef = false)
+{
+	if (ptr == nullptr)
+		return std::unique_ptr<T, ReferenceDeleter<T>>(nullptr);
+
+	if (addRef)
+	{
+		ptr->AddRef();
+	}
+
+	return std::unique_ptr<T, ReferenceDeleter<T>>(ptr);
+}
+
+template <typename T> using unique_ref = std::unique_ptr<T, ReferenceDeleter<T>>;
 
 class VertexBuffer;
 class IndexBuffer;
@@ -281,5 +322,72 @@ class CommandList;
 class Compiler;
 class RenderPass;
 class RenderPassPipelineState;
+
+enum class LogType
+{
+	Info,
+	Warning,
+	Error,
+	Debug,
+};
+
+void SetLogger(const std::function<void(LogType, const char*)>& logger);
+
+void Log(LogType logType, const char* message);
+
+inline size_t GetAlignedSize(size_t size, size_t alignment) { return (size + (alignment - 1)) & ~(alignment - 1); }
+
+inline int32_t GetTextureMemorySize(TextureFormatType format, Vec2I size)
+{
+	switch (format)
+	{
+	case TextureFormatType::R8G8B8A8_UNORM:
+		return size.X * size.Y * 4;
+	case TextureFormatType::R16G16B16A16_FLOAT:
+		return size.X * size.Y * 8;
+	case TextureFormatType::R32G32B32A32_FLOAT:
+		return size.X * size.Y * 16;
+	case TextureFormatType::R8G8B8A8_UNORM_SRGB:
+		return size.X * size.Y * 4;
+	case TextureFormatType::R16G16_FLOAT:
+		return size.X * size.Y * 4;
+	case TextureFormatType::R8_UNORM:
+		return size.X * size.Y * 1;
+	default:
+		assert(0);
+	}
+	return 0;
+}
+
+/**
+	@brief	window abstraction class
+*/
+class Window
+{
+public:
+	Window() = default;
+
+	virtual ~Window() = default;
+
+	/**
+		@brief	called when platform calls newframe, if it need to exit, return false
+	*/
+	virtual bool OnNewFrame() = 0;
+
+	/**
+		@brief return native window ptr
+	*/
+	virtual void* GetNativePtr(int32_t index) = 0;
+
+	/**
+		@brief	return current window size
+	*/
+	virtual Vec2I GetWindowSize() const = 0;
+
+	/**
+		@brief  return current frame buffer  size
+	*/
+	virtual Vec2I GetFrameBufferSize() const { return GetWindowSize(); }
+};
 
 } // namespace LLGI

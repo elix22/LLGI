@@ -36,23 +36,35 @@ PlatformDX12::PlatformDX12()
 {
 	for (int32_t i = 0; i < SwapBufferCount; i++)
 	{
-		RenderPass[i] = nullptr;
+		renderResources_[i] = nullptr;
 	}
+
+	renderTargets_.fill(nullptr);
 }
 
 PlatformDX12::~PlatformDX12()
 {
 	Wait();
 
+	for (int32_t i = 0; i < renderTargets_.size(); i++)
+	{
+		SafeRelease(renderTargets_[i]);
+	}
+
 	SafeRelease(descriptorHeapRTV);
 
 	for (int32_t i = 0; i < SwapBufferCount; i++)
 	{
-		SafeRelease(RenderPass[i]);
+		SafeRelease(renderResources_[i]);
+		SafeRelease(renderPasses_[i]);
 		handleRTV[i] = {};
 	}
 
-	SafeRelease(commandAllocator);
+	for (auto& commandAllocator : commandAllocators)
+	{
+		SafeRelease(commandAllocator);
+	}
+
 	SafeRelease(commandListStart);
 	SafeRelease(commandListPresent);
 	SafeRelease(commandQueue);
@@ -66,17 +78,119 @@ PlatformDX12::~PlatformDX12()
 		CloseHandle(fenceEvent);
 		fenceEvent = nullptr;
 	}
-
-	window.Terminate();
 }
 
-bool PlatformDX12::Initialize(Vec2I windowSize)
+void PlatformDX12::ResetSwapBuffer() {
+
+	Wait();
+
+	for (int32_t i = 0; i < renderTargets_.size(); i++)
+	{
+		SafeRelease(renderTargets_[i]);
+	}
+
+	SafeRelease(descriptorHeapRTV);
+
+	for (int32_t i = 0; i < SwapBufferCount; i++)
+	{
+		SafeRelease(renderResources_[i]);
+		SafeRelease(renderPasses_[i]);
+		handleRTV[i] = {};
+	}
+
+	SafeRelease(swapChain);
+}
+
+bool PlatformDX12::GenerateSwapBuffer() {
+	// Swap chain
+	DXGI_SWAP_CHAIN_DESC DXGISwapChainDesc;
+	ZeroMemory(&DXGISwapChainDesc, sizeof(DXGISwapChainDesc));
+
+	D3D12_DESCRIPTOR_HEAP_DESC renderPassHeapDesc = {};
+
+	DXGISwapChainDesc.BufferDesc.Width = windowSize_.X;
+	DXGISwapChainDesc.BufferDesc.Height = windowSize_.Y;
+	DXGISwapChainDesc.OutputWindow = (HWND)window_->GetNativePtr(0);
+	DXGISwapChainDesc.Windowed = TRUE;
+	DXGISwapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+	DXGISwapChainDesc.BufferCount = SwapBufferCount;
+	DXGISwapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+	DXGISwapChainDesc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+	DXGISwapChainDesc.BufferDesc.RefreshRate.Numerator = 60;
+	DXGISwapChainDesc.BufferDesc.RefreshRate.Denominator = 1;
+	DXGISwapChainDesc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	DXGISwapChainDesc.BufferDesc.ScanlineOrdering = DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED;
+	DXGISwapChainDesc.BufferDesc.Scaling = DXGI_MODE_SCALING_UNSPECIFIED;
+	DXGISwapChainDesc.SampleDesc.Count = 1;
+	DXGISwapChainDesc.SampleDesc.Quality = 0;
+
+	IDXGISwapChain* swapChain_ = nullptr;
+	auto hr = dxgiFactory->CreateSwapChain(commandQueue, &DXGISwapChainDesc, &swapChain_);
+	if (FAILED(hr))
+	{
+		goto FAILED_EXIT;
+	}
+
+	hr = swapChain_->QueryInterface(&swapChain);
+	if (FAILED(hr))
+	{
+		SafeRelease(swapChain_);
+		goto FAILED_EXIT;
+	}
+	SafeRelease(swapChain_);
+
+	// Render target
+	
+	// Render target DescriptorHeap
+	renderPassHeapDesc.NumDescriptors = SwapBufferCount;
+	renderPassHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+	renderPassHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+	renderPassHeapDesc.NodeMask = 0;
+	hr = device->CreateDescriptorHeap(&renderPassHeapDesc, IID_PPV_ARGS(&descriptorHeapRTV));
+	if (FAILED(hr))
+	{
+		goto FAILED_EXIT;
+	}
+
+	auto descriptorHandleIncrementSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+	for (int32_t i = 0; i < SwapBufferCount; ++i)
+	{
+
+		// get render target from swap chain
+		hr = swapChain->GetBuffer(i, IID_PPV_ARGS(&renderResources_[i]));
+		if (FAILED(hr))
+		{
+			goto FAILED_EXIT;
+		}
+
+		D3D12_RENDER_TARGET_VIEW_DESC rtvDesc = {};
+		rtvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+
+		handleRTV[i] = descriptorHeapRTV->GetCPUDescriptorHandleForHeapStart();
+		handleRTV[i].ptr += descriptorHandleIncrementSize * i;
+		device->CreateRenderTargetView(renderResources_[i], &rtvDesc, handleRTV[i]);
+
+		renderTargets_[i] = new TextureDX12(renderResources_[i], device, commandQueue);
+		renderPasses_[i] = new RenderPassDX12(device);
+		renderPasses_[i]->Initialize(&renderTargets_[i], 1, nullptr);
+	}
+
+	return true;
+FAILED_EXIT:;
+	SafeRelease(swapChain_);
+
+	ResetSwapBuffer();
+
+	return false;
+}
+
+bool PlatformDX12::Initialize(Window* window, bool waitVSync)
 {
 	// Windows
-	if (!window.Initialize("DirectX12", windowSize))
-	{
-		return false;
-	}
+	window_ = window;
+	windowSize_ = window->GetWindowSize();
+	waitVSync_ = waitVSync;
 
 	// DirectX12
 	HRESULT hr;
@@ -186,95 +300,36 @@ bool PlatformDX12::Initialize(Vec2I windowSize)
 	fenceEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
 
 	// Swap chain
-	DXGI_SWAP_CHAIN_DESC DXGISwapChainDesc;
-	ZeroMemory(&DXGISwapChainDesc, sizeof(DXGISwapChainDesc));
-
-	DXGISwapChainDesc.BufferDesc.Width = windowSize.X;
-	DXGISwapChainDesc.BufferDesc.Height = windowSize.Y;
-	DXGISwapChainDesc.OutputWindow = window.GetHandle();
-	DXGISwapChainDesc.Windowed = TRUE;
-	DXGISwapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-	DXGISwapChainDesc.BufferCount = SwapBufferCount;
-	DXGISwapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-	DXGISwapChainDesc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
-	DXGISwapChainDesc.BufferDesc.RefreshRate.Numerator = 60;
-	DXGISwapChainDesc.BufferDesc.RefreshRate.Denominator = 1;
-	DXGISwapChainDesc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-	DXGISwapChainDesc.BufferDesc.ScanlineOrdering = DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED;
-	DXGISwapChainDesc.BufferDesc.Scaling = DXGI_MODE_SCALING_UNSPECIFIED;
-	DXGISwapChainDesc.SampleDesc.Count = 1;
-	DXGISwapChainDesc.SampleDesc.Quality = 0;
-
-	IDXGISwapChain* swapChain_ = nullptr;
-	hr = dxgiFactory->CreateSwapChain(commandQueue, &DXGISwapChainDesc, &swapChain_);
-	if (FAILED(hr))
+	if (!GenerateSwapBuffer())
 	{
 		goto FAILED_EXIT;
 	}
-
-	hr = swapChain_->QueryInterface(&swapChain);
-	if (FAILED(hr))
-	{
-		SafeRelease(swapChain_);
-		goto FAILED_EXIT;
-	}
-	SafeRelease(swapChain_);
 
 	// Create Command Allocator
-	hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&commandAllocator));
-	if (FAILED(hr))
+	for (auto& commandAllocator : commandAllocators)
 	{
-		goto FAILED_EXIT;
+		hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&commandAllocator));
+		if (FAILED(hr))
+		{
+			goto FAILED_EXIT;
+		}
 	}
 
 	// Create Command List
-	hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocator, NULL, IID_PPV_ARGS(&commandListStart));
+	hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocators[0], NULL, IID_PPV_ARGS(&commandListStart));
 	if (FAILED(hr))
 	{
 		goto FAILED_EXIT;
 	}
 	commandListStart->Close();
 
-	hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocator, NULL, IID_PPV_ARGS(&commandListPresent));
+	hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocators[0], NULL, IID_PPV_ARGS(&commandListPresent));
 	if (FAILED(hr))
 	{
 		goto FAILED_EXIT;
 	}
 	commandListPresent->Close();
 
-	// Render target
-	D3D12_DESCRIPTOR_HEAP_DESC RenderPassHeapDesc = {};
-
-	// Render target DescriptorHeap
-	RenderPassHeapDesc.NumDescriptors = SwapBufferCount;
-	RenderPassHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-	RenderPassHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-	RenderPassHeapDesc.NodeMask = 0;
-	hr = device->CreateDescriptorHeap(&RenderPassHeapDesc, IID_PPV_ARGS(&descriptorHeapRTV));
-	if (FAILED(hr))
-	{
-		goto FAILED_EXIT;
-	}
-
-	auto descriptorHandleIncrementSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-	for (int32_t i = 0; i < SwapBufferCount; ++i)
-	{
-
-		// get render target from swap chain
-		hr = swapChain->GetBuffer(i, IID_PPV_ARGS(&RenderPass[i]));
-		if (FAILED(hr))
-		{
-			goto FAILED_EXIT;
-		}
-
-		D3D12_RENDER_TARGET_VIEW_DESC rtvDesc = {};
-		rtvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-		rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-
-		handleRTV[i] = descriptorHeapRTV->GetCPUDescriptorHandleForHeapStart();
-		handleRTV[i].ptr += descriptorHandleIncrementSize * i;
-		device->CreateRenderTargetView(RenderPass[i], &rtvDesc, handleRTV[i]);
-	}
 
 	return true;
 
@@ -284,11 +339,15 @@ FAILED_EXIT:;
 
 	for (int32_t i = 0; i < SwapBufferCount; i++)
 	{
-		SafeRelease(RenderPass[i]);
+		SafeRelease(renderResources_[i]);
 		handleRTV[i] = {};
 	}
 
-	SafeRelease(commandAllocator);
+	for (auto& commandAllocator : commandAllocators)
+	{
+		SafeRelease(commandAllocator);
+	}
+
 	SafeRelease(commandListStart);
 	SafeRelease(commandListPresent);
 	SafeRelease(commandQueue);
@@ -308,74 +367,91 @@ FAILED_EXIT:;
 
 bool PlatformDX12::NewFrame()
 {
-	if (!window.DoEvent())
+	if (!window_->OnNewFrame())
 	{
 		return false;
 	}
 
 	frameIndex = swapChain->GetCurrentBackBufferIndex();
 
-	commandListStart->Reset(commandAllocator, nullptr);
+	commandAllocators.at(0)->Reset();
+	commandListStart->Reset(commandAllocators.at(0), nullptr);
 
-	D3D12_RESOURCE_BARRIER barrier;
-	ZeroMemory(&barrier, sizeof(barrier));
-	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-	barrier.Transition.pResource = RenderPass[frameIndex];
-	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-	commandListStart->ResourceBarrier(1, &barrier);
+	renderTargets_[frameIndex]->ResourceBarrior(commandListStart, D3D12_RESOURCE_STATE_RENDER_TARGET);
+
 	commandListStart->OMSetRenderTargets(1, &(handleRTV[frameIndex]), FALSE, nullptr);
 	commandListStart->Close();
 
 	ID3D12CommandList* commandList[] = {commandListStart};
 	commandQueue->ExecuteCommandLists(1, commandList);
 
+	inFrame_ = true;
 	return true;
 }
 
 void PlatformDX12::Present()
 {
-	commandListPresent->Reset(commandAllocator, nullptr);
+	commandListPresent->Reset(commandAllocators.at(0), nullptr);
 
-	D3D12_RESOURCE_BARRIER barrier;
-	ZeroMemory(&barrier, sizeof(barrier));
-	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-	barrier.Transition.pResource = RenderPass[frameIndex];
-	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+	renderTargets_[frameIndex]->ResourceBarrior(commandListPresent, D3D12_RESOURCE_STATE_PRESENT);
 
-	commandListPresent->ResourceBarrier(1, &barrier);
 	commandListPresent->Close();
 
 	ID3D12CommandList* commandList[] = {commandListPresent};
 	commandQueue->ExecuteCommandLists(1, commandList);
 
-	swapChain->Present(1, 0);
+	swapChain->Present(waitVSync_ ? 1 : 0, 0);
 	Wait();
+
+	inFrame_ = false;
 }
 
 Graphics* PlatformDX12::CreateGraphics()
 {
-	std::function<std::tuple<D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource*>()> getScreenFunc =
-		[this]() -> std::tuple<D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource*> {
-		std::tuple<D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource*> ret(handleRTV[frameIndex], RenderPass[frameIndex]);
+	std::function<std::tuple<D3D12_CPU_DESCRIPTOR_HANDLE, Texture*>()> getScreenFunc =
+		[this]() -> std::tuple<D3D12_CPU_DESCRIPTOR_HANDLE, Texture*> {
+		std::tuple<D3D12_CPU_DESCRIPTOR_HANDLE, Texture*> ret(handleRTV[frameIndex], renderTargets_[frameIndex]);
 
 		return ret;
 	};
 
 	std::function<void()> waitFunc = [this]() -> void { this->Wait(); };
 
-	auto graphics = new GraphicsDX12(device, getScreenFunc, waitFunc, commandQueue, SwapBufferCount);
+	auto graphics = new GraphicsDX12(device, getScreenFunc, waitFunc, commandQueue, SwapBufferCount, this);
 
-	graphics->SetWindowSize(Vec2I(1280, 720));
+	graphics->SetWindowSize(windowSize_);
 
 	return graphics;
 }
 
 ID3D12Device* PlatformDX12::GetDevice() { return device; }
+
+void PlatformDX12::SetWindowSize(const Vec2I& windowSize) {
+
+	if (windowSize_ == windowSize)
+	{
+		return;	
+	}
+
+	if (inFrame_)
+	{
+		Log(LogType::Error, "SetWindowSize can be only called before NewFrame after Present.");
+		return;
+	}
+
+	windowSize_ = windowSize;
+
+	ResetSwapBuffer();
+	GenerateSwapBuffer();
+}
+
+RenderPass* PlatformDX12::GetCurrentScreen(const Color8& clearColor, bool isColorCleared, bool isDepthCleared)
+{
+	auto renderPass = renderPasses_[frameIndex];
+	renderPass->SetClearColor(clearColor);
+	renderPass->SetIsColorCleared(isColorCleared);
+	renderPass->SetIsDepthCleared(isDepthCleared);
+	return renderPass;
+}
 
 } // namespace LLGI

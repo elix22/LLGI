@@ -31,6 +31,12 @@ protected:
 		int32_t offset = 0;
 	};
 
+	struct BindingIndexBuffer
+	{
+		IndexBuffer* indexBuffer = nullptr;
+		int32_t offset = 0;
+	};
+
 	struct BindingTexture
 	{
 		Texture* texture = nullptr;
@@ -48,22 +54,28 @@ private:
 	int32_t swapCount_ = 0;
 	std::vector<SwapObject> swapObjects;
 
+    
 	BindingVertexBuffer bindingVertexBuffer;
-	IndexBuffer* currentIndexBuffer = nullptr;
+	BindingIndexBuffer bindingIndexBuffer;
+
 	PipelineState* currentPipelineState = nullptr;
 
 	bool isVertexBufferDirtied = true;
 	bool isCurrentIndexBufferDirtied = true;
 	bool isPipelineDirtied = true;
+	bool doesBeginWithPlatform_ = false;
 
 	std::array<ConstantBuffer*, static_cast<int>(ShaderStageType::Max)> constantBuffers;
 
 protected:
+	bool isInRenderPass_ = false;
+    bool isInBegin_ = false;
+    
 	std::array<std::array<BindingTexture, NumTexture>, static_cast<int>(ShaderStageType::Max)> currentTextures;
 
 protected:
 	void GetCurrentVertexBuffer(BindingVertexBuffer& buffer, bool& isDirtied);
-	void GetCurrentIndexBuffer(IndexBuffer*& buffer, bool& isDirtied);
+	void GetCurrentIndexBuffer(BindingIndexBuffer& buffer, bool& isDirtied);
 	void GetCurrentPipelineState(PipelineState*& pipelineState, bool& isDirtied);
 	void GetCurrentConstantBuffer(ShaderStageType type, ConstantBuffer*& buffer);
 	void RegisterReferencedObject(ReferenceObject* referencedObject);
@@ -85,27 +97,45 @@ public:
 		Internal context is not used if platformContextPtr is null in Metal.
 		This function can be called once by a frame.
 	*/
-	virtual bool BeginWithPlatform(void* platformContextPtr) { return false; }
+	virtual bool BeginWithPlatform(void* platformContextPtr);
 
 	virtual void End();
+	virtual void EndWithPlatform();
 
 	virtual void SetScissor(int32_t x, int32_t y, int32_t width, int32_t height);
 	virtual void Draw(int32_t pritimiveCount);
 	virtual void SetVertexBuffer(VertexBuffer* vertexBuffer, int32_t stride, int32_t offset);
-	virtual void SetIndexBuffer(IndexBuffer* indexBuffer);
+	virtual void SetIndexBuffer(IndexBuffer* indexBuffer, int32_t offset = 0);
 	virtual void SetPipelineState(PipelineState* pipelineState);
 	virtual void SetConstantBuffer(ConstantBuffer* constantBuffer, ShaderStageType shaderStage);
+
+	/**
+		@brief	copy a texture
+	*/
+	virtual void CopyTexture(Texture* src, Texture* dst) {}
+
+	/**
+		@brief specify textures
+		@note
+		shaderStage is ignored in DirectX12 (common textures are used on all stages)
+	*/
 	virtual void
 	SetTexture(Texture* texture, TextureWrapMode wrapMode, TextureMinMagFilter minmagFilter, int32_t unit, ShaderStageType shaderStage);
+
+	/**
+		@brief	reset textures and set null.
+	*/
+	virtual void ResetTextures();
+
 	virtual void BeginRenderPass(RenderPass* renderPass);
 
 	/**
 		@brief
 		added a command into supecified renderpass. This function is supported in some platform.
 	*/
-	virtual bool BeginRenderPassWithPlatformPtr(void* platformPtr) { return false; }
+	virtual bool BeginRenderPassWithPlatformPtr(void* platformPtr);
 
-	virtual void EndRenderPass() {}
+	virtual void EndRenderPass() { isInRenderPass_ = false; }
 
 	/**
 		@brief
@@ -132,16 +162,13 @@ public:
 		@brief	send a memory in specified texture from cpu to gpu
 	*/
 	virtual void SetImageData2D(Texture* texture, int32_t x, int32_t y, int32_t width, int32_t height, const void* data);
-};
 
-// TODO: see https://github.com/altseed/LLGI/issues/26
-class CommandListPool : public ReferenceObject
-{
-public:
-	CommandListPool(int32_t swapCount);
-	virtual ~CommandListPool() = default;
+	/**
+		@brief wait until this command is completed.
+	*/
+	virtual void WaitUntilCompleted();
 
-	virtual CommandList* Get();
+	bool GetIsInRenderPass() const;
 };
 
 } // namespace LLGI

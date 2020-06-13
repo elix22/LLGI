@@ -2,6 +2,9 @@
 #pragma once
 
 #include "LLGI.Base.h"
+#include "Utils/LLGI.FixedSizeVector.h"
+#include <functional>
+#include <unordered_map>
 
 namespace LLGI
 {
@@ -17,6 +20,7 @@ struct RenderTextureInitializationParameter
 {
 	Vec2I Size;
 	TextureFormatType Format = TextureFormatType::R8G8B8A8_UNORM;
+	bool IsMultiSampling = false;
 };
 
 struct DepthTextureInitializationParameter
@@ -29,9 +33,25 @@ struct DepthTextureInitializationParameter
 */
 class SingleFrameMemoryPool : public ReferenceObject
 {
+protected:
+	int32_t currentSwapBuffer_ = -1;
+	int32_t swapBufferCount_ = 0;
+	std::vector<int32_t> offsets_;
+	std::vector<std::vector<ConstantBuffer*>> constantBuffers_;
+
+	/**
+		@brief	create constant buffer
+	*/
+	virtual ConstantBuffer* CreateConstantBufferInternal(int32_t size) { return nullptr; }
+
+	/**
+		@brief	reinitialize buffer with a size
+	*/
+	virtual ConstantBuffer* ReinitializeConstantBuffer(ConstantBuffer* cb, int32_t size) { return nullptr; }
+
 public:
-	SingleFrameMemoryPool() = default;
-	virtual ~SingleFrameMemoryPool() = default;
+	SingleFrameMemoryPool(int32_t swapBufferCount = 3);
+	virtual ~SingleFrameMemoryPool();
 
 	/**
 	@brief	Start new frame
@@ -50,9 +70,20 @@ private:
 
 	Color8 color_;
 
+	FixedSizeVector<Texture*, RenderTargetMax> renderTextures_;
+	Texture* depthTexture_ = nullptr;
+
+protected:
+	Vec2I screenSize_;
+
+	bool assignRenderTextures(Texture** textures, int32_t count);
+	bool assignDepthTexture(Texture* depthTexture);
+
+	bool getSize(Vec2I& size, const Texture** textures, int32_t textureCount, Texture* depthTexture) const;
+
 public:
 	RenderPass() = default;
-	virtual ~RenderPass() = default;
+	virtual ~RenderPass();
 
 	virtual bool GetIsColorCleared() const { return isColorCleared_; }
 
@@ -66,15 +97,60 @@ public:
 
 	virtual void SetClearColor(const Color8& color);
 
-	virtual Texture* GetColorBuffer(int index);
+	virtual Texture* GetRenderTexture(int index) const { return renderTextures_.at(index); }
 
-	/**
-		@brief	create a RenderPassPipelineState
-		@note
-		This is a function to create an object.
-		But it is very fast. So it can call it in everyframe.
-	*/
-	virtual RenderPassPipelineState* CreateRenderPassPipelineState();
+	virtual int GetRenderTextureCount() const { return static_cast<int32_t>(renderTextures_.size()); }
+
+	Texture* GetDepthTexture() const { return depthTexture_; }
+
+	bool GetHasDepthTexture() const { return GetDepthTexture() != nullptr; }
+
+	virtual bool GetIsSwapchainScreen() const;
+
+	virtual Vec2I GetScreenSize() const { return screenSize_; }
+};
+
+struct RenderPassPipelineStateKey
+{
+	bool IsPresent = false;
+	bool HasDepth = false;
+	FixedSizeVector<TextureFormatType, RenderTargetMax> RenderTargetFormats;
+	bool IsColorCleared = true;
+	bool IsDepthCleared = true;
+
+	bool operator==(const RenderPassPipelineStateKey& value) const
+	{
+		if (RenderTargetFormats.size() != value.RenderTargetFormats.size())
+			return false;
+
+		for (size_t i = 0; i < RenderTargetFormats.size(); i++)
+		{
+			if (RenderTargetFormats.at(i) != value.RenderTargetFormats.at(i))
+				return false;
+		}
+
+		return (IsPresent == value.IsPresent && HasDepth == value.HasDepth && IsColorCleared == value.IsColorCleared && IsDepthCleared == value.IsDepthCleared);
+	}
+
+	struct Hash
+	{
+		typedef std::size_t result_type;
+
+		std::size_t operator()(const RenderPassPipelineStateKey& key) const
+		{
+			auto ret = std::hash<bool>()(key.IsPresent);
+			ret += std::hash<bool>()(key.HasDepth);
+			ret += std::hash<bool>()(key.IsColorCleared);
+			ret += std::hash<bool>()(key.IsDepthCleared);
+
+			for (int32_t i = 0; i < key.RenderTargetFormats.size(); i++)
+			{
+				ret += std::hash<uint64_t>()((uint64_t)key.RenderTargetFormats.at(i));
+			}
+
+			return ret;
+		}
+	};
 };
 
 /**
@@ -96,12 +172,13 @@ class Graphics : public ReferenceObject
 {
 protected:
 	Vec2I windowSize_;
+	std::function<void()> disposed_;
 
 public:
 	Graphics() = default;
-	virtual ~Graphics() = default;
+	virtual ~Graphics();
 
-	[[deprecated("use Platform::SetWindowSize.")]] virtual void SetWindowSize(const Vec2I& windowSize);
+	/*[[deprecated("use Platform::SetWindowSize.")]]*/ virtual void SetWindowSize(const Vec2I& windowSize);
 
 	/**
 		@brief	Execute commands
@@ -113,17 +190,7 @@ public:
 	/**
 	@brief	to prevent instances to be disposed before finish rendering, finish all renderings.
 	*/
-	virtual void WaitFinish(){}
-
-		/**
-			@brief get render pass of screen to show on a display.
-			@note
-			Don't release and addref it.
-			Don't use it for the many purposes, please input Clear or SetRenderPass immediately.
-		*/
-		[[deprecated("use Platform::GetCurrentScreen.")]] virtual RenderPass* GetCurrentScreen(const Color8& clearColor = Color8(),
-																							   bool isColorCleared = false,
-																							   bool isDepthCleared = false);
+	virtual void WaitFinish() {}
 
 	/**
 		@brief	create a vertex buffer
@@ -142,18 +209,15 @@ public:
 
 	/**
 		@brief create a memory pool
+        @param  drawingCount(drawingCount is ignored in DirectX12)
 	*/
-	[[deprecated("use Graphics::CreateCommandListPool.")]] virtual SingleFrameMemoryPool*
-	CreateSingleFrameMemoryPool(int32_t constantBufferPoolSize, int32_t drawingCount);
+	virtual SingleFrameMemoryPool* CreateSingleFrameMemoryPool(int32_t constantBufferPoolSize, int32_t drawingCount);
 
 	/**
 		@brief
 		@param memoryPool if memory pool is null, allocate memory from graphics
 	*/
-	[[deprecated("use Graphics::CreateCommandListPool.")]] virtual CommandList* CreateCommandList(SingleFrameMemoryPool* memoryPool);
-
-	// TODO: see https://github.com/altseed/LLGI/issues/26
-	virtual CommandListPool* CreateCommandListPool(int32_t constantBufferPoolSize, int32_t drawingCount, int32_t swapbufferCount);
+	virtual CommandList* CreateCommandList(SingleFrameMemoryPool* memoryPool);
 
 	/**
 		@brief	create a constant buffer
@@ -169,16 +233,35 @@ public:
 
 	virtual Texture* CreateDepthTexture(const DepthTextureInitializationParameter& parameter) { return nullptr; }
 
-	[[deprecated("please use CreateTexture, CreateRenderTexture and CreateDepthTexture")]] virtual Texture*
-	CreateTexture(const Vec2I& size, bool isRenderPass, bool isDepthBuffer);
-
 	/**
 		@brief	create texture from pointer or id in current platform
 	*/
 	virtual Texture* CreateTexture(uint64_t id);
 
+	/**
+		@brief	create a RenderPassPipelineState
+		@note
+		This is a function to create an object.
+		But it is very fast. So it can call it in everyframe.
+	*/
+	virtual RenderPassPipelineState* CreateRenderPassPipelineState(RenderPass* renderPass);
+
+	/**
+		@brief	create a RenderPassPipelineState
+		@note
+		This is a function to create an object.
+		But it is very fast. So it can call it in everyframe.
+	*/
+	virtual RenderPassPipelineState* CreateRenderPassPipelineState(const RenderPassPipelineStateKey& key) { return nullptr; }
+
 	/** For testing. Wait for all commands in queue to complete. Then read data from specified render target. */
 	virtual std::vector<uint8_t> CaptureRenderTarget(Texture* renderTarget);
+
+	/**
+		@brief	specify a function which is called when this instance is disposed.
+		@param	disposed	called function
+	*/
+	void SetDisposed(const std::function<void()>& disposed);
 };
 
 } // namespace LLGI

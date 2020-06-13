@@ -3,6 +3,7 @@
 
 #include "../LLGI.Platform.h"
 #include "LLGI.BaseDX12.h"
+#include "LLGI.TextureDX12.h"
 
 #ifdef _WIN32
 #include "../Win/LLGI.WindowWin.h"
@@ -15,7 +16,9 @@ class PlatformDX12 : public Platform
 {
 private:
 	static const int SwapBufferCount = 2;
-	WindowWin window;
+	Window* window_ = nullptr;
+
+	Vec2I windowSize_;
 
 	ID3D12Device* device = nullptr;
 	IDXGIFactory4* dxgiFactory = nullptr;
@@ -26,28 +29,39 @@ private:
 
 	ID3D12DescriptorHeap* descriptorHeapRTV = nullptr;
 	D3D12_CPU_DESCRIPTOR_HANDLE handleRTV[SwapBufferCount];
-	ID3D12Resource* RenderPass[SwapBufferCount];
-
-	ID3D12CommandAllocator* commandAllocator = nullptr;
+	ID3D12Resource* renderResources_[SwapBufferCount];
+	std::array<TextureDX12*, SwapBufferCount> renderTargets_;
+	std::array<RenderPassDX12*, SwapBufferCount> renderPasses_;
+	
+	std::array<ID3D12CommandAllocator*, SwapBufferCount> commandAllocators;
 	ID3D12GraphicsCommandList* commandListStart = nullptr;
 	ID3D12GraphicsCommandList* commandListPresent = nullptr;
 	UINT64 fenceValue = 1;
 
 	int32_t frameIndex = 0;
 
+	bool inFrame_ = false;
+
 	void Wait();
+
+	void ResetSwapBuffer();
+	bool GenerateSwapBuffer();
 
 public:
 	PlatformDX12();
 	virtual ~PlatformDX12();
 
-	bool Initialize(Vec2I windowSize);
+	bool Initialize(Window* window, bool waitVSync);
 
 	bool NewFrame() override;
 	void Present() override;
 	Graphics* CreateGraphics() override;
 
 	ID3D12Device* GetDevice();
+
+	void SetWindowSize(const Vec2I& windowSize) override;
+
+	RenderPass* GetCurrentScreen(const Color8& clearColor, bool isColorCleared, bool isDepthCleared) override;
 
 	DeviceType GetDeviceType() const override { return DeviceType::DirectX12; }
 };

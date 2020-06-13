@@ -12,7 +12,7 @@ protected:
 	std::shared_ptr<RenderPassPipelineState> renderPassPipelineState_ = nullptr;
 
 public:
-	PipelineState() = default;
+	PipelineState();
 	virtual ~PipelineState() = default;
 
 	CullingMode Culling = CullingMode::Clockwise;
@@ -32,9 +32,14 @@ public:
 	bool IsDepthWriteEnabled = false;
 	bool IsStencilTestEnabled = false;
 	DepthFuncType DepthFunc = DepthFuncType::Less;
+	
+	bool IsMSAA = false;
 
-	std::array<std::string, 16> VertexLayoutNames;
-	std::array<VertexLayoutFormat, 16> VertexLayouts;
+	std::array<std::string, VertexLayoutMax> VertexLayoutNames;
+	std::array<VertexLayoutFormat, VertexLayoutMax> VertexLayouts;
+	
+	//! only for DirectX12
+	std::array<int32_t, VertexLayoutMax> VertexLayoutSemantics;
 	int32_t VertexLayoutCount = 0;
 
 	virtual void SetShader(ShaderStageType stage, Shader* shader);

@@ -15,66 +15,24 @@ struct RenderPassPipelineState_Impl;
 class GraphicsMetal;
 class RenderPassMetal;
 class RenderPassPipelineStateMetal;
-
-class RenderPassMetal : public RenderPass
-{
-	GraphicsMetal* graphics_ = nullptr;
-	bool isStrongRef_ = false;
-	RenderPass_Impl* impl = nullptr;
-	std::shared_ptr<RenderPassPipelineStateMetal> renderPassPipelineState;
-
-public:
-	RenderPassMetal(GraphicsMetal* graphics, bool isStrongRef);
-
-	virtual ~RenderPassMetal();
-
-	void SetIsColorCleared(bool isColorCleared) override;
-
-	void SetIsDepthCleared(bool isDepthCleared) override;
-
-	void SetClearColor(const Color8& color) override;
-
-	RenderPass_Impl* GetImpl() const;
-
-	RenderPassPipelineState* CreateRenderPassPipelineState() override;
-};
-
-class RenderPassPipelineStateMetal : public RenderPassPipelineState
-{
-private:
-	RenderPassPipelineState_Impl* impl = nullptr;
-
-public:
-	RenderPassPipelineStateMetal();
-	virtual ~RenderPassPipelineStateMetal();
-
-	RenderPassPipelineState_Impl* GetImpl() const;
-};
-
+class TextureMetal;
+    
 struct RenderPassPipelineStateMetalKey
 {
-	MTLPixelFormat format;
-
-	bool operator==(const RenderPassPipelineStateMetalKey& value) const { return (format == value.format); }
-
-	struct Hash
-	{
-		typedef std::size_t result_type;
-
-		std::size_t operator()(const RenderPassPipelineStateMetalKey& key) const
-		{
-			return std::hash<std::int32_t>()(static_cast<int>(key.format));
-		}
-	};
-};
-
-class SingleFrameMemoryPoolMetal : public SingleFrameMemoryPool
-{
-public:
-	SingleFrameMemoryPoolMetal(GraphicsMetal* graphics, int32_t constantBufferPoolSize, int32_t drawingCount) {}
-	virtual ~SingleFrameMemoryPoolMetal() = default;
-	virtual void NewFrame() override { printf("Warning: Not implemented.¥n"); }
-	virtual ConstantBuffer* CreateConstantBuffer(int32_t size) override { printf("Warning: Not implemented.¥n"); }
+    MTLPixelFormat format;
+	MTLPixelFormat depthStencilFormat = MTLPixelFormatInvalid;	// MTLPixelFormatInvalid if texture is not set.
+        
+    bool operator==(const RenderPassPipelineStateMetalKey& value) const { return (format == value.format && depthStencilFormat == value.depthStencilFormat); }
+        
+    struct Hash
+    {
+        typedef std::size_t result_type;
+            
+        std::size_t operator()(const RenderPassPipelineStateMetalKey& key) const
+        {
+            return std::hash<std::int32_t>()(static_cast<int>(key.format) + (static_cast<int>(key.depthStencilFormat) * 10000));
+        }
+    };
 };
 
 struct GraphicsView
@@ -86,12 +44,14 @@ class GraphicsMetal : public Graphics
 {
 	Graphics_Impl* impl = nullptr;
 
-	std::unordered_map<RenderPassPipelineStateMetalKey, std::weak_ptr<RenderPassPipelineStateMetal>, RenderPassPipelineStateMetalKey::Hash>
+    //! cached
+	std::unordered_map<RenderPassPipelineStateMetalKey, std::shared_ptr<RenderPassPipelineStateMetal>, RenderPassPipelineStateMetalKey::Hash>
 		renderPassPipelineStates;
 
 	std::shared_ptr<RenderPassMetal> renderPass_ = nullptr;
 	std::function<GraphicsView()> getGraphicsView_;
-
+    std::vector<CommandList*> executingCommandList_;
+    
 public:
 	GraphicsMetal();
 	virtual ~GraphicsMetal();
@@ -104,7 +64,7 @@ public:
 
 	void WaitFinish() override;
 
-	RenderPass* GetCurrentScreen(const Color8& clearColor, bool isColorCleared, bool isDepthCleared) override;
+	//RenderPass* GetCurrentScreen(const Color8& clearColor, bool isColorCleared, bool isDepthCleared) override;
 
 	VertexBuffer* CreateVertexBuffer(int32_t size) override;
 
@@ -122,13 +82,24 @@ public:
 
 	RenderPass* CreateRenderPass(const Texture** textures, int32_t textureCount, Texture* depthTexture) override;
 
-	Texture* CreateTexture(const Vec2I& size, bool isRenderPass, bool isDepthBuffer) override;
+	Texture* CreateTexture(const TextureInitializationParameter& parameter) override;
+	
+	Texture* CreateRenderTexture(const RenderTextureInitializationParameter& parameter) override;
 
+	Texture* CreateDepthTexture(const DepthTextureInitializationParameter& parameter) override;
+	
 	Texture* CreateTexture(uint64_t id) override;
 
-	std::shared_ptr<RenderPassPipelineStateMetal> CreateRenderPassPipelineState(MTLPixelFormat format);
+    //! internal function
+	std::shared_ptr<RenderPassPipelineStateMetal> CreateRenderPassPipelineState(MTLPixelFormat format, MTLPixelFormat depthStencilFormat);
+
+    RenderPassPipelineState* CreateRenderPassPipelineState(RenderPass* renderPass) override;
+    
+	std::vector<uint8_t> CaptureRenderTarget(Texture* renderTarget) override;
 
 	Graphics_Impl* GetImpl() const;
+
+    RenderPassMetal* GetRenderPass() const { return renderPass_.get(); }
 };
 
 } // namespace LLGI

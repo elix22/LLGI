@@ -7,6 +7,8 @@
 #include "LLGI.ShaderMetal.h"
 #include "LLGI.VertexBufferMetal.h"
 #include "LLGI.TextureMetal.h"
+#include "LLGI.SingleFrameMemoryPoolMetal.h"
+#include "LLGI.RenderPassMetal.h"
 #import <MetalKit/MetalKit.h>
 
 namespace LLGI
@@ -31,112 +33,38 @@ bool Graphics_Impl::Initialize()
 {
 	device = MTLCreateSystemDefaultDevice();
 	commandQueue = [device newCommandQueue];
+	
+	maxMultiSamplingCount = 0;
+	int testSampleCounts[] = {8, 4, 2, 1};
+	for (int count : testSampleCounts)
+	{
+		bool supported = [device supportsTextureSampleCount:count];
+		if (supported)
+		{
+			maxMultiSamplingCount = count;
+			break;
+		}
+	}
+	if (maxMultiSamplingCount == 0)
+		throw "Unsupported.";
+	
 	return true;
 }
 
 void Graphics_Impl::Execute(CommandList_Impl* commandBuffer) { [commandBuffer->commandBuffer commit]; }
 
-RenderPass_Impl::RenderPass_Impl() {}
-
-RenderPass_Impl::~RenderPass_Impl()
-{
-	if (renderPassDescriptor != nullptr)
-	{
-		[renderPassDescriptor release];
-		renderPassDescriptor = nullptr;
-	}
-}
-
-bool RenderPass_Impl::Initialize()
-{
-	renderPassDescriptor = [[MTLRenderPassDescriptor alloc] init];
-	return true;
-}
-
-void RenderPass_Impl::UpdateTarget(Graphics_Impl* graphics)
-{
-    renderPassDescriptor.colorAttachments[0].texture = graphics->drawable.texture;
-    pixelFormat = graphics->drawable.texture.pixelFormat;
-}
-    
-void RenderPass_Impl::UpdateTarget(Texture_Impl** textures, int32_t textureCount, Texture_Impl* depthTexture)
-{
-    for(int i = 0; i < textureCount; i++)
-    {
-        renderPassDescriptor.colorAttachments[i].texture = textures[i]->texture;
-    }
-    
-    if(depthTexture != nullptr)
-    {
-        renderPassDescriptor.depthAttachment.texture = depthTexture->texture;
-    }
-    
-    pixelFormat = textures[0]->texture.pixelFormat;
-}
-
-    
-RenderPassMetal::RenderPassMetal(GraphicsMetal* graphics, bool isStrongRef) : graphics_(graphics), isStrongRef_(isStrongRef)
-{
-	if (isStrongRef_)
-	{
-		SafeAddRef(graphics_);
-	}
-
-	impl = new RenderPass_Impl();
-	impl->Initialize();
-}
-
-RenderPassMetal::~RenderPassMetal()
-{
-	SafeDelete(impl);
-
-	if (isStrongRef_)
-	{
-		SafeRelease(graphics_);
-	}
-}
-
-void RenderPassMetal::SetIsColorCleared(bool isColorCleared)
-{
-	impl->isColorCleared = isColorCleared;
-	RenderPass::SetIsColorCleared(isColorCleared);
-}
-
-void RenderPassMetal::SetIsDepthCleared(bool isDepthCleared)
-{
-	impl->isDepthCleared = isDepthCleared;
-	RenderPass::SetIsDepthCleared(isDepthCleared);
-}
-
-void RenderPassMetal::SetClearColor(const Color8& color)
-{
-	impl->clearColor = color;
-	RenderPass::SetClearColor(color);
-}
-
-RenderPass_Impl* RenderPassMetal::GetImpl() const { return impl; }
-
-RenderPassPipelineState* RenderPassMetal::CreateRenderPassPipelineState()
-{
-	if (renderPassPipelineState == nullptr)
-	{
-		renderPassPipelineState = graphics_->CreateRenderPassPipelineState(GetImpl()->pixelFormat);
-	}
-
-	auto ret = renderPassPipelineState.get();
-	SafeAddRef(ret);
-	return ret;
-}
-
-RenderPassPipelineStateMetal::RenderPassPipelineStateMetal() { impl = new RenderPassPipelineState_Impl(); }
-
-RenderPassPipelineStateMetal::~RenderPassPipelineStateMetal() { SafeDelete(impl); }
-
-RenderPassPipelineState_Impl* RenderPassPipelineStateMetal::GetImpl() const { return impl; }
-
 GraphicsMetal::GraphicsMetal() { impl = new Graphics_Impl(); }
 
-GraphicsMetal::~GraphicsMetal() { SafeDelete(impl); }
+GraphicsMetal::~GraphicsMetal() {
+    
+    for (auto cb : executingCommandList_) {
+        cb->Release();
+    }
+    executingCommandList_.clear();
+    
+    renderPassPipelineStates.clear();
+    SafeDelete(impl);
+}
 
 bool GraphicsMetal::Initialize(std::function<GraphicsView()> getGraphicsView)
 {
@@ -147,7 +75,7 @@ bool GraphicsMetal::Initialize(std::function<GraphicsView()> getGraphicsView)
 		return false;
 	}
 
-	renderPass_ = std::make_shared<RenderPassMetal>(this, false);
+	renderPass_ = CreateSharedPtr(new RenderPassMetal());
 
 	return true;
 }
@@ -156,14 +84,43 @@ void GraphicsMetal::SetWindowSize(const Vec2I& windowSize) { throw "Not inplemen
 
 void GraphicsMetal::Execute(CommandList* commandList)
 {
+    // remove finished commands
+    auto it = std::remove_if(executingCommandList_.begin(), executingCommandList_.end(),
+      [](CommandList* cb) {
+        auto c = static_cast<CommandListMetal*>(cb);
+        if(c->GetImpl()->isCompleted)
+        {
+            cb->Release();
+            return true;
+        }
+        return false;
+    });
+    
+    executingCommandList_.erase(it, executingCommandList_.end());
+    
 	auto commandList_ = (CommandListMetal*)commandList;
+    commandList_->GetImpl()->isCompleted = false;
 	impl->Execute(commandList_->GetImpl());
+    
+    SafeAddRef(commandList);
+    executingCommandList_.push_back(commandList);
 }
 
-void GraphicsMetal::WaitFinish() { throw "Not inplemented"; }
+void GraphicsMetal::WaitFinish() {
 
+    for (auto cb : executingCommandList_) {
+        auto c = static_cast<CommandListMetal*>(cb);
+        c->WaitUntilCompleted();
+        cb->Release();
+    }
+    executingCommandList_.clear();
+}
+
+/*
 RenderPass* GraphicsMetal::GetCurrentScreen(const Color8& clearColor, bool isColorCleared, bool isDepthCleared)
 {
+    assert(false);
+    
 	if (getGraphicsView_ != nullptr)
 	{
 		auto view = getGraphicsView_();
@@ -173,9 +130,11 @@ RenderPass* GraphicsMetal::GetCurrentScreen(const Color8& clearColor, bool isCol
 	renderPass_->SetClearColor(clearColor);
 	renderPass_->SetIsColorCleared(isColorCleared);
 	renderPass_->SetIsDepthCleared(isDepthCleared);
-    renderPass_->GetImpl()->UpdateTarget(impl);
+	//renderPass_->UpdateTarget(this);
+	
 	return renderPass_.get();
 }
+*/
 
 VertexBuffer* GraphicsMetal::CreateVertexBuffer(int32_t size)
 {
@@ -224,8 +183,8 @@ PipelineState* GraphicsMetal::CreatePiplineState()
 }
 
 SingleFrameMemoryPool* GraphicsMetal::CreateSingleFrameMemoryPool(int32_t constantBufferPoolSize, int32_t drawingCount)
-{
-	return new SingleFrameMemoryPoolMetal(this, constantBufferPoolSize, drawingCount);
+{    
+	return new SingleFrameMemoryPoolMetal(this, false, constantBufferPoolSize, drawingCount);
 }
 
 CommandList* GraphicsMetal::CreateCommandList(SingleFrameMemoryPool* memoryPool)
@@ -253,44 +212,60 @@ ConstantBuffer* GraphicsMetal::CreateConstantBuffer(int32_t size) {
 
 RenderPass* GraphicsMetal::CreateRenderPass(const Texture** textures, int32_t textureCount, Texture* depthTexture)
 {
-    auto renderPass = new RenderPassMetal(this, true);
+    auto renderPass = new RenderPassMetal();
 
-    std::array<Texture_Impl*, 16> textures_;
-    Texture_Impl* depth_ = nullptr;
-    textures_.fill(nullptr);
-    
-    for(int i = 0; i < textureCount; i++)
+    if(!renderPass->UpdateRenderTarget((Texture**)textures, textureCount, depthTexture))
     {
-        textures_[i] = static_cast<const TextureMetal*>(textures[i])->GetImpl();
+        SafeRelease(renderPass);
+        return nullptr;
     }
-    
-    if(depthTexture != nullptr)
-    {
-        depth_ = static_cast<const TextureMetal*>(depthTexture)->GetImpl();
-    }
-    
-    renderPass->GetImpl()->UpdateTarget(textures_.data(), textureCount, depth_);
     
     return renderPass;
 }
 
-Texture* GraphicsMetal::CreateTexture(const Vec2I& size, bool isRenderPass, bool isDepthBuffer) {
-    auto o = new TextureMetal();
-    if (o->Initialize(this, size, isRenderPass, isDepthBuffer))
+Texture* GraphicsMetal::CreateTexture(const TextureInitializationParameter& parameter)
+{
+	auto o = new TextureMetal();
+    if (o->Initialize(this->GetImpl()->device, this, parameter.Size, TextureType::Color))
     {
         return o;
     }
     
     SafeRelease(o);
-    return nullptr;    
+    return nullptr;
+}
+
+Texture* GraphicsMetal::CreateRenderTexture(const RenderTextureInitializationParameter& parameter)
+{
+	auto o = new TextureMetal();
+    if (o->Initialize(this, parameter))
+    {
+        return o;
+    }
+    
+    SafeRelease(o);
+    return nullptr;
+}
+
+Texture* GraphicsMetal::CreateDepthTexture(const DepthTextureInitializationParameter& parameter)
+{
+	auto o = new TextureMetal();
+    if (o->Initialize(this->GetImpl()->device, this, parameter.Size, TextureType::Depth))
+    {
+        return o;
+    }
+    
+    SafeRelease(o);
+    return nullptr;
 }
 
 Texture* GraphicsMetal::CreateTexture(uint64_t id) { throw "Not inplemented"; }
 
-std::shared_ptr<RenderPassPipelineStateMetal> GraphicsMetal::CreateRenderPassPipelineState(MTLPixelFormat format)
+std::shared_ptr<RenderPassPipelineStateMetal> GraphicsMetal::CreateRenderPassPipelineState(MTLPixelFormat format, MTLPixelFormat depthStencilFormat)
 {
 	RenderPassPipelineStateMetalKey key;
 	key.format = format;
+	key.depthStencilFormat = depthStencilFormat;
 
 	// already?
 	{
@@ -298,19 +273,52 @@ std::shared_ptr<RenderPassPipelineStateMetal> GraphicsMetal::CreateRenderPassPip
 
 		if (it != renderPassPipelineStates.end())
 		{
-			auto ret = it->second.lock();
+            auto ret = it->second;
 
 			if (ret != nullptr)
 				return ret;
 		}
 	}
 
-	std::shared_ptr<RenderPassPipelineStateMetal> ret = std::make_shared<RenderPassPipelineStateMetal>();
+	std::shared_ptr<RenderPassPipelineStateMetal> ret = LLGI::CreateSharedPtr<>(new RenderPassPipelineStateMetal());
 	ret->GetImpl()->pixelFormat = format;
+	ret->GetImpl()->depthStencilFormat = depthStencilFormat;
 
 	renderPassPipelineStates[key] = ret;
 
 	return ret;
+}
+    
+RenderPassPipelineState* GraphicsMetal::CreateRenderPassPipelineState(RenderPass* renderPass)
+{
+    auto renderPass_ = static_cast<RenderPassMetal*>(renderPass);
+    
+    auto renderPassPipelineState = CreateRenderPassPipelineState(
+		renderPass_->GetImpl()->pixelFormat, renderPass_->GetImpl()->depthStencilFormat);
+
+    auto ret = renderPassPipelineState.get();
+    SafeAddRef(ret);
+    return ret;
+}
+
+std::vector<uint8_t> GraphicsMetal::CaptureRenderTarget(Texture* renderTarget)
+{
+	auto metalTexture = static_cast<TextureMetal*>(renderTarget);
+	auto width = metalTexture->GetSizeAs2D().X;
+	auto height = metalTexture->GetSizeAs2D().Y;
+	auto impl = metalTexture->GetImpl();
+	
+	NSUInteger bytesPerPixel = 4;	// TODO: backbuffer only
+	NSUInteger imageByteCount = width * height * bytesPerPixel;
+	NSUInteger bytesPerRow = width * bytesPerPixel;
+	MTLRegion region = MTLRegionMake2D(0, 0, width, height);
+	
+	std::vector<uint8_t> data;
+	data.resize(imageByteCount);
+	[impl->texture getBytes:data.data() bytesPerRow:bytesPerRow fromRegion:region mipmapLevel:0];
+	// order: B=[0], G=[1], R=[2], A=[3]
+	
+	return data;
 }
 
 Graphics_Impl* GraphicsMetal::GetImpl() const { return impl; }

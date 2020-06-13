@@ -1,3 +1,7 @@
+#ifdef _WIN32
+#define NOMINMAX
+#endif
+
 #include "LLGI.CommandListVulkan.h"
 #include "LLGI.ConstantBufferVulkan.h"
 #include "LLGI.GraphicsVulkan.h"
@@ -23,21 +27,21 @@ DescriptorPoolVulkan::DescriptorPoolVulkan(std::shared_ptr<GraphicsVulkan> graph
 	poolInfo.pPoolSizes = poolSizes.data();
 	poolInfo.maxSets = size * stage;
 
-	descriptorPool = graphics_->GetDevice().createDescriptorPool(poolInfo);
+	descriptorPool_ = graphics_->GetDevice().createDescriptorPool(poolInfo);
 }
 
 DescriptorPoolVulkan ::~DescriptorPoolVulkan()
 {
-	if (descriptorPool != nullptr)
+	if (descriptorPool_)
 	{
-		graphics_->GetDevice().destroyDescriptorPool(descriptorPool);
-		descriptorPool = nullptr;
+		graphics_->GetDevice().destroyDescriptorPool(descriptorPool_);
+		descriptorPool_ = nullptr;
 	}
 }
 
 const std::vector<vk::DescriptorSet>& DescriptorPoolVulkan::Get(PipelineStateVulkan* pip)
 {
-	if (cache.size() < static_cast<size_t>(offset))
+	if (cache.size() > static_cast<size_t>(offset))
 	{
 		offset++;
 		return cache[offset - 1];
@@ -45,7 +49,7 @@ const std::vector<vk::DescriptorSet>& DescriptorPoolVulkan::Get(PipelineStateVul
 
 	// TODO : improve it
 	vk::DescriptorSetAllocateInfo allocateInfo;
-	allocateInfo.descriptorPool = descriptorPool;
+	allocateInfo.descriptorPool = descriptorPool_;
 	allocateInfo.descriptorSetCount = 2;
 	allocateInfo.pSetLayouts = (pip->GetDescriptorSetLayout().data());
 
@@ -64,32 +68,64 @@ CommandListVulkan::~CommandListVulkan()
 	commandBuffers.clear();
 
 	descriptorPools.clear();
+
+	for (size_t i = 0; i < fences_.size(); i++)
+	{
+		graphics_->GetDevice().destroyFence(fences_[i]);
+	}
+	fences_.clear();
 }
 
-bool CommandListVulkan::Initialize(GraphicsVulkan* graphics, int32_t drawingCount)
+bool CommandListVulkan::Initialize(GraphicsVulkan* graphics, int32_t drawingCount, CommandListPreCondition precondition)
 {
 	SafeAddRef(graphics);
 	graphics_ = CreateSharedPtr(graphics);
 
-	vk::CommandBufferAllocateInfo allocInfo;
-	allocInfo.commandPool = graphics->GetCommandPool();
-	allocInfo.commandBufferCount = graphics->GetSwapBufferCount();
-	commandBuffers = graphics->GetDevice().allocateCommandBuffers(allocInfo);
+	if (precondition == CommandListPreCondition::Standalone)
+	{
+		vk::CommandBufferAllocateInfo allocInfo;
+		allocInfo.commandPool = graphics->GetCommandPool();
+		allocInfo.commandBufferCount = graphics->GetSwapBufferCount();
+		commandBuffers = graphics->GetDevice().allocateCommandBuffers(allocInfo);
+	}
+	else
+	{
+		commandBuffers.resize(graphics_->GetSwapBufferCount());
+	}
 
 	for (size_t i = 0; i < static_cast<size_t>(graphics_->GetSwapBufferCount()); i++)
 	{
 		auto dp = std::make_shared<DescriptorPoolVulkan>(graphics_, drawingCount, 2);
 		descriptorPools.push_back(dp);
+
+		fences_.emplace_back(graphics->GetDevice().createFence(vk::FenceCreateFlags()));
 	}
 
 	currentSwapBufferIndex_ = -1;
 	return true;
 }
 
+void CommandListVulkan::BeginExternal(VkCommandBuffer nativeCommandBuffer)
+{
+	currentSwapBufferIndex_++;
+	currentSwapBufferIndex_ %= commandBuffers.size();
+
+	commandBuffers[currentSwapBufferIndex_] = vk::CommandBuffer(nativeCommandBuffer);
+
+	auto& dp = descriptorPools[currentSwapBufferIndex_];
+	dp->Reset();
+
+	CommandList::Begin();
+}
+
+void CommandListVulkan::EndExternal() { commandBuffers[currentSwapBufferIndex_] = vk::CommandBuffer(); }
+
 void CommandListVulkan::Begin()
 {
 	currentSwapBufferIndex_++;
 	currentSwapBufferIndex_ %= commandBuffers.size();
+
+	graphics_->GetDevice().resetFences(1, &(fences_[currentSwapBufferIndex_]));
 
 	auto& cmdBuffer = commandBuffers[currentSwapBufferIndex_];
 
@@ -120,7 +156,7 @@ void CommandListVulkan::SetScissor(int32_t x, int32_t y, int32_t width, int32_t 
 void CommandListVulkan::Draw(int32_t pritimiveCount)
 {
 	BindingVertexBuffer vb_;
-	IndexBuffer* ib_ = nullptr;
+	BindingIndexBuffer ib_;
 	PipelineState* pip_ = nullptr;
 
 	bool isVBDirtied = false;
@@ -132,11 +168,11 @@ void CommandListVulkan::Draw(int32_t pritimiveCount)
 	GetCurrentPipelineState(pip_, isPipDirtied);
 
 	assert(vb_.vertexBuffer != nullptr);
-	assert(ib_ != nullptr);
+	assert(ib_.indexBuffer != nullptr);
 	assert(pip_ != nullptr);
 
 	auto vb = static_cast<VertexBufferVulkan*>(vb_.vertexBuffer);
-	auto ib = static_cast<IndexBufferVulkan*>(ib_);
+	auto ib = static_cast<IndexBufferVulkan*>(ib_.indexBuffer);
 	auto pip = static_cast<PipelineStateVulkan*>(pip_);
 
 	auto& cmdBuffer = commandBuffers[currentSwapBufferIndex_];
@@ -145,13 +181,14 @@ void CommandListVulkan::Draw(int32_t pritimiveCount)
 	if (isVBDirtied)
 	{
 		vk::DeviceSize vertexOffsets = vb_.offset;
-		cmdBuffer.bindVertexBuffers(0, 1, &(vb->GetBuffer()), &vertexOffsets);
+		vk::Buffer vkBuf = vb->GetBuffer();
+		cmdBuffer.bindVertexBuffers(0, 1, &(vkBuf), &vertexOffsets);
 	}
 
 	// assign an index vuffer
 	if (isIBDirtied)
 	{
-		vk::DeviceSize indexOffset = 0;
+		vk::DeviceSize indexOffset = ib_.offset;
 		vk::IndexType indexType = vk::IndexType::eUint16;
 
 		if (ib->GetStride() == 2)
@@ -320,6 +357,43 @@ void CommandListVulkan::Draw(int32_t pritimiveCount)
 	CommandList::Draw(pritimiveCount);
 }
 
+void CommandListVulkan::CopyTexture(Texture* src, Texture* dst)
+{
+	if (isInRenderPass_)
+	{
+		Log(LogType::Error, "Please call CopyTexture outside of RenderPass");
+		return;
+	}
+
+	auto& cmdBuffer = commandBuffers[currentSwapBufferIndex_];
+
+	auto srcTex = static_cast<TextureVulkan*>(src);
+	auto dstTex = static_cast<TextureVulkan*>(dst);
+
+	std::array<vk::ImageCopy, 1> imageCopy;
+	imageCopy[0].dstOffset = vk::Offset3D(0, 0, 0);
+	imageCopy[0].srcOffset = vk::Offset3D(0, 0, 0);
+	imageCopy[0].extent.width = src->GetSizeAs2D().X;
+	imageCopy[0].extent.height = src->GetSizeAs2D().Y;
+	imageCopy[0].extent.depth = 1;
+	imageCopy[0].srcSubresource.aspectMask = srcTex->GetSubresourceRange().aspectMask;
+	imageCopy[0].srcSubresource.layerCount = 1;
+	imageCopy[0].srcSubresource.baseArrayLayer = 0;
+
+	imageCopy[0].dstSubresource.aspectMask = dstTex->GetSubresourceRange().aspectMask;
+	imageCopy[0].dstSubresource.layerCount = 1;
+	imageCopy[0].dstSubresource.baseArrayLayer = 0;
+
+	srcTex->ResourceBarrior(cmdBuffer, vk::ImageLayout::eTransferSrcOptimal);
+	dstTex->ResourceBarrior(cmdBuffer, vk::ImageLayout::eTransferDstOptimal);
+	cmdBuffer.copyImage(srcTex->GetImage(), srcTex->GetImageLayout(), dstTex->GetImage(), dstTex->GetImageLayout(), imageCopy);
+	dstTex->ResourceBarrior(cmdBuffer, vk::ImageLayout::eShaderReadOnlyOptimal);
+	srcTex->ResourceBarrior(cmdBuffer, vk::ImageLayout::eShaderReadOnlyOptimal);
+
+	RegisterReferencedObject(src);
+	RegisterReferencedObject(dst);
+}
+
 void CommandListVulkan::BeginRenderPass(RenderPass* renderPass)
 {
 	auto renderPass_ = static_cast<RenderPassVulkan*>(renderPass);
@@ -342,50 +416,38 @@ void CommandListVulkan::BeginRenderPass(RenderPass* renderPass)
 
 	auto& cmdBuffer = commandBuffers[currentSwapBufferIndex_];
 
-	/*
-	// to make screen clear
-	SetImageLayout(
-		cmdBuffer, renderPass_->colorBuffers[0], vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal, colorSubRange);
-	SetImageLayout(cmdBuffer,
-				   renderPass_->depthBuffer,
-				   vk::ImageLayout::eDepthStencilAttachmentOptimal,
-				   vk::ImageLayout::eTransferDstOptimal,
-				   depthSubRange);
+	vk::ClearValue clear_values[RenderTargetMax + 1];
+	int clearValueCount = 0;
 
 	if (renderPass->GetIsColorCleared())
 	{
-		cmdBuffer.clearColorImage(renderPass_->colorBuffers[0], vk::ImageLayout::eTransferDstOptimal, clearColor, colorSubRange);
+		for (int32_t i = 0; i < renderPass_->GetRenderTextureCount(); i++)
+		{
+			clear_values[i].color = clearColor;
+			clearValueCount++;
+		}
 	}
 
-	if (renderPass->GetIsDepthCleared())
+	if (renderPass_->GetHasDepthTexture() && renderPass->GetIsDepthCleared())
 	{
-		cmdBuffer.clearDepthStencilImage(renderPass_->depthBuffer, vk::ImageLayout::eTransferDstOptimal, clearDepth, depthSubRange);
+		clear_values[renderPass_->GetRenderTextureCount()].depthStencil = clearDepth;
+		clearValueCount++;
 	}
 
-	// to draw
-	SetImageLayout(cmdBuffer,
-				   renderPass_->colorBuffers[0],
-				   vk::ImageLayout::eTransferDstOptimal,
-				   vk::ImageLayout::eColorAttachmentOptimal,
-				   colorSubRange);
+	clear_values[renderPass_->GetRenderTextureCount()].depthStencil = clearDepth;
 
-	SetImageLayout(cmdBuffer,
-				   renderPass_->depthBuffer,
-				   vk::ImageLayout::eTransferDstOptimal,
-				   vk::ImageLayout::eDepthStencilAttachmentOptimal,
-				   depthSubRange);
-	*/
-
-	vk::ClearValue clear_values[2];
-	clear_values[0].color = clearColor;
-	clear_values[1].depthStencil = clearDepth;
+	if (renderPass_->GetHasDepthTexture())
+	{
+		auto t = static_cast<TextureVulkan*>(renderPass_->GetDepthTexture());
+		t->ResourceBarrior(cmdBuffer, vk::ImageLayout::eDepthStencilAttachmentOptimal);
+	}
 
 	// begin renderpass
 	vk::RenderPassBeginInfo renderPassBeginInfo;
-	renderPassBeginInfo.framebuffer = renderPass_->frameBuffer;
+	renderPassBeginInfo.framebuffer = renderPass_->frameBuffer_;
 	renderPassBeginInfo.renderPass = renderPass_->renderPassPipelineState->GetRenderPass();
 	renderPassBeginInfo.renderArea.extent = vk::Extent2D(renderPass_->GetImageSize().X, renderPass_->GetImageSize().Y);
-	renderPassBeginInfo.clearValueCount = 2;
+	renderPassBeginInfo.clearValueCount = clearValueCount;
 	renderPassBeginInfo.pClearValues = clear_values;
 	cmdBuffer.beginRenderPass(renderPassBeginInfo, vk::SubpassContents::eInline);
 
@@ -395,6 +457,20 @@ void CommandListVulkan::BeginRenderPass(RenderPass* renderPass)
 
 	vk::Rect2D scissor = vk::Rect2D(vk::Offset2D(), vk::Extent2D(renderPass_->GetImageSize().X, renderPass_->GetImageSize().Y));
 	cmdBuffer.setScissor(0, scissor);
+
+	for (size_t i = 0; i < renderPass_->GetRenderTextureCount(); i++)
+	{
+		auto t = static_cast<TextureVulkan*>(renderPass_->GetRenderTexture(i));
+		t->ChangeImageLayout(renderPass_->renderPassPipelineState->finalLayouts_.at(i));
+	}
+
+	if (renderPass_->GetHasDepthTexture())
+	{
+		auto t = static_cast<TextureVulkan*>(renderPass_->GetDepthTexture());
+		t->ChangeImageLayout(renderPass_->renderPassPipelineState->finalLayouts_.at(renderPass_->GetRenderTextureCount()));
+	}
+
+	CommandList::BeginRenderPass(renderPass);
 }
 
 void CommandListVulkan::EndRenderPass()
@@ -403,12 +479,26 @@ void CommandListVulkan::EndRenderPass()
 
 	// end renderpass
 	cmdBuffer.endRenderPass();
+
+	CommandList::EndRenderPass();
 }
 
 vk::CommandBuffer CommandListVulkan::GetCommandBuffer() const
 {
 	auto& cmdBuffer = commandBuffers[currentSwapBufferIndex_];
 	return cmdBuffer;
+}
+
+vk::Fence CommandListVulkan::GetFence() const { return fences_[currentSwapBufferIndex_]; }
+
+void CommandListVulkan::WaitUntilCompleted()
+{
+	if (currentSwapBufferIndex_ >= 0)
+	{
+		vk::Result fenceRes =
+			graphics_->GetDevice().waitForFences(fences_[currentSwapBufferIndex_], VK_TRUE, std::numeric_limits<int>::max());
+		assert(fenceRes == vk::Result::eSuccess);
+	}
 }
 
 } // namespace LLGI

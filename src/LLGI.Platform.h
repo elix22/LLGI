@@ -3,14 +3,29 @@
 
 #include "LLGI.Base.h"
 
+#ifdef _WIN32
+#undef CreateWindow
+#endif
+
 namespace LLGI
 {
 
-Platform* CreatePlatform(DeviceType platformDeviceType);
+struct PlatformParameter
+{
+	DeviceType Device;
+	bool WaitVSync;
+};
+
+Window* CreateWindow(const char* title, Vec2I windowSize);
+
+Platform* CreatePlatform(const PlatformParameter& parameter, Window* window);
 
 class Platform : public ReferenceObject
 {
 private:
+protected:
+	bool waitVSync_ = false;
+
 public:
 	Platform() = default;
 	virtual ~Platform() = default;
@@ -20,7 +35,14 @@ public:
 	virtual Graphics* CreateGraphics();
 	virtual DeviceType GetDeviceType() const { return DeviceType::Default; }
 
+    /*
+     @brief change this window size
+     @note
+     the argument is ignored on Mac. This function notify that an window size is changed.
+    **/
 	virtual void SetWindowSize(const Vec2I& windowSize);
+
+	bool GetWaitVSync() const { return waitVSync_; }
 
 	/**
 		@brief get render pass of screen to show on a display.

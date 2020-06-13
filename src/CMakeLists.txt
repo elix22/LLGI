@@ -6,9 +6,15 @@ file(GLOB files_pc PC/*.h PC/*.cpp)
 
 list(APPEND files ${files_pc})
 
-if(MSVC)
+if(WIN32)
   file(GLOB files_win Win/*.h Win/*.cpp)
   list(APPEND files ${files_win})
+elseif(APPLE)
+  file(GLOB files_mac Mac/*.h Mac/*.cpp Mac/*.mm)
+  list(APPEND files ${files_mac})
+else()
+  file(GLOB files_linux Linux/*.h Linux/*.cpp)
+  list(APPEND files ${files_linux})
 endif()
 
 if(MSVC)
@@ -22,7 +28,7 @@ if(BUILD_VULKAN)
   add_definitions(-DENABLE_VULKAN)
 endif()
 
-if(BUILD_METAL)
+if(APPLE)
   file(GLOB files_metal Metal/*.h Metal/*.cpp Metal/*.mm)
   list(APPEND files ${files_metal})
 endif()
@@ -66,7 +72,71 @@ if(BUILD_VULKAN)
   find_package(Vulkan REQUIRED)
   target_include_directories(LLGI PRIVATE ${Vulkan_INCLUDE_DIRS})
   target_link_libraries(LLGI PRIVATE ${Vulkan_LIBRARIES})
+  if(BUILD_VULKAN_COMPILER)
+    target_link_libraries(LLGI PRIVATE glslang SPIRV)
+  endif()
 endif()
+
+if(WIN32)
+elseif(APPLE)
+else()
+  set_property(TARGET LLGI PROPERTY POSITION_INDEPENDENT_CODE TRUE) 
+endif()
+
+#--------------------
+# Install glslang
+#   FIXME: This code is "HACK" for a cmake successful configuration.
+#          glslang doesn't support EXPORT, so get an error.
+#          Overriding glslang installation settings.
+
+if(BUILD_VULKAN)
+
+  if(BUILD_VULKAN_COMPILER)
+
+    set_target_properties(glslang PROPERTIES INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_INSTALL_PREFIX}/include)
+    set_target_properties(SPIRV PROPERTIES INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_INSTALL_PREFIX}/include)
+    target_include_directories(glslang PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../thirdparty/glslang>)
+    target_include_directories(SPIRV PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../thirdparty/glslang>)
+
+    install(TARGETS glslang
+            EXPORT glslang-export
+            INCLUDES DESTINATION include/LLGI
+            PUBLIC_HEADER DESTINATION include/LLGI
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    install(EXPORT glslang-export
+            FILE glslang-config.cmake
+            DESTINATION lib/cmake)
+        
+    install(TARGETS OGLCompiler
+            EXPORT OGLCompiler-export
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    install(EXPORT OGLCompiler-export
+            FILE OGLCompiler-config.cmake
+            DESTINATION lib/cmake)
+
+    install(TARGETS OSDependent
+            EXPORT OSDependent-export
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    install(EXPORT OSDependent-export
+            FILE OSDependent-config.cmake
+            DESTINATION lib/cmake)
+        
+    install(TARGETS HLSL
+            EXPORT HLSL-export
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    install(EXPORT HLSL-export
+            FILE HLSL-config.cmake
+            DESTINATION lib/cmake)
+
+    install(TARGETS SPIRV
+            EXPORT SPIRV-export
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    install(EXPORT SPIRV-export
+            FILE SPIRV-config.cmake
+            DESTINATION lib/cmake)
+  endif()
+endif()
+
 
 #--------------------
 # Install
